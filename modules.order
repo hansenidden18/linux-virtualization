@@ -1,0 +1,17 @@
+arch/x86/kvm/kvm-intel.ko
+fs/f2fs/f2fs.ko
+fs/efivarfs/efivarfs.ko
+fs/zonefs/zonefs.ko
+crypto/crc32_generic.ko
+drivers/thermal/intel/x86_pkg_temp_thermal.ko
+drivers/md/dm-multipath.ko
+drivers/md/dm-round-robin.ko
+drivers/md/dm-zoned.ko
+drivers/eli/eli.ko
+net/netfilter/nf_log_syslog.ko
+net/netfilter/xt_mark.ko
+net/netfilter/xt_nat.ko
+net/netfilter/xt_LOG.ko
+net/netfilter/xt_MASQUERADE.ko
+net/netfilter/xt_addrtype.ko
+net/ipv4/netfilter/iptable_nat.ko
