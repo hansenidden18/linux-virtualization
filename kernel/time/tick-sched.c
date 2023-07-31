@@ -1487,7 +1487,7 @@ static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 
 	//hrtimer_forward(timer, now, TICK_NSEC);
 
-	return HRTIMER_RESTART;
+	return HRTIMER_NORESTART;
 }
 
 static int sched_skew_tick;
