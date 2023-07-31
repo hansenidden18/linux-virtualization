@@ -1,1 +1,0 @@
-cmd_/home/femu/git/linux/tools/objtool/arch/x86/objtool-in.o :=  ld -r -o /home/femu/git/linux/tools/objtool/arch/x86/objtool-in.o  /home/femu/git/linux/tools/objtool/arch/x86/special.o /home/femu/git/linux/tools/objtool/arch/x86/decode.o

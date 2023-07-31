@@ -1,1 +1,0 @@
-cmd_arch/x86/kvm/kvm-intel.mod := printf '%s\n'   vmx/vmx.o vmx/vmenter.o vmx/pmu_intel.o vmx/vmcs12.o vmx/evmcs.o vmx/nested.o vmx/posted_intr.o | awk '!x[$$0]++ { print("arch/x86/kvm/"$$0) }' > arch/x86/kvm/kvm-intel.mod
