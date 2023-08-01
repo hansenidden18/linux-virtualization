@@ -13777,6 +13777,7 @@ void kvm_arch_eli_remap_vector(struct kvm *kvm,
 		kvm_x86_ops.eli_remap_vector(vcpu, guest_vector, host_irq);
 	}
 }
+EXPORT_SYMBOL_GPL(kvm_arch_eli_remap_vector);
 
 static int __init kvm_x86_init(void)
 {
