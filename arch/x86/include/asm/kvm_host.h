@@ -1646,6 +1646,9 @@ struct kvm_x86_ops {
 	unsigned long (*vcpu_get_apicv_inhibit_reasons)(struct kvm_vcpu *vcpu);
 
 	void (*eli_remap_vector)(struct kvm_vcpu *vcpu, int guest_vector, int host_irq);
+	int (*send_posted_interrupt)(struct kvm_vcpu *vcpu, int delivery_mode,
+					int vector, int level, int trig_mode);
+	int (*has_posted_interrupts)(struct kvm_vcpu *vcpu);
 };
 
 struct kvm_x86_nested_ops {

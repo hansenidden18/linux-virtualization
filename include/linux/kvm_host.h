@@ -1357,14 +1357,14 @@ bool kvm_vcpu_wake_up(struct kvm_vcpu *vcpu);
 void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
 int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
 			int vector, int level, int trig_mode);
-/*int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
 			int vector, int level, int trig_mode);
 
 int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
 			int vector, int level, int trig_mode);
 
 int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
-			int vector, int level, int trig_mode);*/
+			int vector, int level, int trig_mode);
 int kvm_vcpu_yield_to(struct kvm_vcpu *target);
 void kvm_vcpu_on_spin(struct kvm_vcpu *vcpu, bool usermode_vcpu_not_eligible);
 

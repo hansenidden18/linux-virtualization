@@ -37,7 +37,7 @@
 
 
 #define TASK_threadsp 2840 /* offsetof(struct task_struct, thread.sp) */
-#define TASK_stack_canary 1352 /* offsetof(struct task_struct, stack_canary) */
+#define TASK_stack_canary 1344 /* offsetof(struct task_struct, stack_canary) */
 
 #define pbe_address 0 /* offsetof(struct pbe, address) */
 #define pbe_orig_address 8 /* offsetof(struct pbe, orig_address) */
