@@ -16,7 +16,7 @@ typedef struct {
 	unsigned int icr_read_retry_count;
 #endif
 #ifdef CONFIG_HAVE_KVM
-	//unsigned int kvm_posted_intr_ipis;
+	unsigned int kvm_posted_intr_ipis;
 	unsigned int kvm_posted_intr_wakeup_ipis;
 	unsigned int kvm_posted_intr_nested_ipis;
 #endif
