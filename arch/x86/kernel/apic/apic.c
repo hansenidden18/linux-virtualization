@@ -63,11 +63,6 @@
 #include <asm/irq_regs.h>
 #include <asm/cpu.h>
 
-int pi_notif_vector = -1;
-EXPORT_SYMBOL_GPL(pi_notif_vector);
-int* pi_injected_vector;
-EXPORT_SYMBOL_GPL(pi_injected_vector);
-
 unsigned int num_processors;
 
 unsigned disabled_cpus;
@@ -2235,27 +2230,6 @@ DEFINE_IDTENTRY_IRQ(spurious_interrupt)
 DEFINE_IDTENTRY_SYSVEC(sysvec_spurious_apic_interrupt)
 {
 	handle_spurious_interrupt(SPURIOUS_APIC_VECTOR);
-}
-
-
-DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_kvm_posted_intr_ipi)
-{
-	// check if we are in the guest or in the host
-	if (pi_injected_vector != NULL) {
-		// if we are in the guest, handlle this
-		// interrupt as usual (will be converted later to
-		// a virtual interrupt according to the descriptor)
-		asm_common_interrupt();
-		return;
-	}
-	// we are in the host thus we need to notify
-	// the kvm handler. KVM will re-queue the
-	// the interrupt
-	
-	inc_irq_stat(irq_eli_count);
-	ack_APIC_irq();
-	if (posted_interrupt_handler != NULL)
-		posted_interrupt_handler();
 }
 
 /*

@@ -5896,171 +5896,6 @@ static void eli_copy_idt_entry(struct vcpu_vmx *vmx,
 	}
 }
 
-
-static int pvpi_init(struct vcpu_vmx *vmx,
-			gva_t notif_vector, gva_t injected_vector) {
-	struct x86_exception err;
-	u32 vector;
-	struct kvm_vcpu *vcpu;
-	gpa_t notif_vector_gpa;
-	gpa_t injected_vector_gpa;
-	int i;
-	struct page *shared_page;
-	int *shared_descriptor;
-
-	notif_vector_gpa = vmx->vcpu.arch.mmu.gva_to_gpa(
-				&vmx->vcpu, notif_vector, 0, &err);
-	injected_vector_gpa = vmx->vcpu.arch.mmu.gva_to_gpa(
-				&vmx->vcpu, injected_vector, 0, &err);
-
-	shared_page = gfn_to_page(vmx->vcpu.kvm,
-				  injected_vector_gpa >> PAGE_SHIFT);
-
-	if (is_error_page(shared_page)) {
-			kvm_release_page_clean(shared_page);
-			printk(KERN_ERR "kvm-eli: error getting shared page!\n");
-			return 0;
-	}
-
-	shared_descriptor = kmap(shared_page);
-
-	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
-		struct vcpu_vmx *v = to_vmx(vcpu);
-		v->posted_interrupts.notif_vector_gpa = notif_vector_gpa;
-		v->posted_interrupts.injected_vector_gpa = injected_vector_gpa;
-		v->posted_interrupts.shared_descriptor_page = shared_page;
-		v->posted_interrupts.shared_descriptor =
-			shared_descriptor+vcpu->vcpu_id;
-		*(v->posted_interrupts.shared_descriptor) = -1;
-	}
-
-	vector = POSTED_INTERRUPT_VECTOR;
-	kvm_write_guest(vmx->vcpu.kvm,
-			vmx->posted_interrupts.notif_vector_gpa, &vector, 4);
-	return 1;
-}
-static void pvpi_release_descriptor(struct vcpu_vmx *vmx) {
-	struct page *shared_page;
-
-	if (!vmx->posted_interrupts.notif_vector_gpa) {
-		return;
-	}
-
-	shared_page = vmx->posted_interrupts.shared_descriptor_page;
-	kunmap(shared_page);
-	kvm_release_page_dirty(shared_page);
-	return;
-}
-
-/* Enable or disable exitless virtual interrupt injection, using paravirtual
- * posted interrupts.
- */
-static int enable_exitless_injection(struct vcpu_vmx *vmx, bool enabled) {
-	struct kvm_vcpu *vcpu;
-	int i;
-	bool setup_idt;
-
-	if (!vmx->posted_interrupts.notif_vector_gpa) {
-		return 0;
-	}
-
-	if (vmx->posted_interrupts.enabled == enabled) {
-		return 0;
-	}
-
-	setup_idt = true;
-	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
-		if (to_vmx(vcpu)->posted_interrupts.enabled &&
-				vcpu != &vmx->vcpu) {
-			setup_idt = false;
-			break;
-		}
-	}
-
-	if (setup_idt) {
-		eli_copy_idt_entry(vmx, POSTED_INTERRUPT_VECTOR, POSTED_INTERRUPT_VECTOR, !enabled /* true to set not present, false to set present */);
-	}
-
-	vmx->posted_interrupts.enabled = enabled;
-	*(vmx->posted_interrupts.shared_descriptor) = -1;
-	return 1;
-}
-
-#define MAX_CPUS 128
-static struct vcpu_vmx *pvpi_vmxs[MAX_CPUS];
-
-#define PVPI_FILTER_VECTOR 0xf0
-static int vmx_send_posted_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
- 				     int vector, int level, int trig_mode)
-{	
-	struct vcpu_vmx *vmx = to_vmx(vcpu);
-	int me;
-	int cpu;
-
-	if (!vmx->posted_interrupts.enabled) {
-		return 0;
-	}
-
-	/* Send paravirtual posted interrupt only if the guest is running, and,
-	 * for reasons explained above, vector is below PVPI_FILTER_VECTOR.
-	 * We don't mind if right after we check, the guest exits - at worst
-	 * the IPI will arrive at the host and we have a handler to.
-	 * TODO: consider also the very unlikely case that the guest has time
-	 * to exit, and reenter a different guest, before we send the IPI.
-	 */
-	if (vmx->vcpu.mode != IN_GUEST_MODE || vector >= PVPI_FILTER_VECTOR)
-		return 0;
-
-	me = get_cpu();
-	cpu = vmx->vcpu.cpu;
-
-	/* send notification vector if different cpu and not pending vector */
-	if (cpu != me) {
-		int pending_vector;
-		/*
-		 * if *shared_descriptor == -1 then
-		 *      *shared_descriptor = vector
-		 *      pending_vector = -1
-		 * else
-		 *      *shared_descriptor is unchanged
-		 *      pending_vector = *shared_descriptor
-		 */		
-		pending_vector = cmpxchg(
-			vmx->posted_interrupts.shared_descriptor, -1, vector);
-
-		if (pending_vector == vector) {
-			put_cpu();
-			return 1;
-		}
-
-		if (pending_vector != -1) {
-			put_cpu();
-			return 0;
-		}
-
-		pvpi_vmxs[cpu] = vmx;
-
-		apic->send_IPI_mask(cpumask_of(cpu), POSTED_INTERRUPT_VECTOR);
-		++(vmx->vcpu.stat.elvis_injections);
-		vmx->posted_interrupts.injected_vector = vector;
-		vmx->posted_interrupts.injected_delivery_mode = delivery_mode;
-		vmx->posted_interrupts.injected_level = level;
-		vmx->posted_interrupts.injected_trig_mode = trig_mode;
-
-		put_cpu();
-		return 1;
-	} else {
-		vmx->posted_interrupts.injected_vector = -1;
-	}
-
-	put_cpu();
-	return 0;
-}
-
-static int vmx_has_posted_interrupts(struct kvm_vcpu *vcpu) {
-	return to_vmx(vcpu)->posted_interrupts.enabled;
-}
-
 /* eli_init initializes ELI (Exit-Less Interrupts) for this vcpu, by
  * remembering the given location (GVA) for the shadow IDT.
  * The contents (and size) of the shadow IDT will only be filled later,
@@ -6268,7 +6103,6 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 			if (vmx->eli.inject_mode)
 				eli_set_inject_mode(vmx, false);
 			else {
-				if (!vmx->posted_interrupts.enabled)
 				vmx->eli.exit_handled = true;
 			}
 		} else if (!vmx->eli.inject_mode && valid  && type == INTR_TYPE_EXT_INTR) {
@@ -6299,9 +6133,6 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 /* hypercalls used to start/stop ExitLess interrupt completion (EOI) */
 #define DI_START_EOI             1101
 #define DI_STOP_EOI              1201
-#define PI_INITIALIZE		 2000
-#define PI_START                 2100
-#define PI_STOP                  2200
 /* hypercalls used to start/stop ExitLess interrupt delivery */
 #define DI_START                  500
 #define DI_STOP                   600
@@ -6341,17 +6172,6 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 			eli_eoi_exiting(vmx, true);
 			vmx->eli.exitless_eoi = false;
 		}
-		break;
-	case PI_INITIALIZE:
-		pvpi_init(vmx,
-			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RBX),
-			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RCX));
-		break;
-	case PI_START:
-		enable_exitless_injection(vmx, true);
-		break;
-	case PI_STOP:
-		enable_exitless_injection(vmx, false);			
 		break;
 	default:
 		return 0; /* hypercall was not handled here */
@@ -8148,8 +7968,6 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 static void vmx_vcpu_free(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
-	if (vcpu->vcpu_id == 0)
-		pvpi_release_descriptor(vmx);
 	if (enable_pml)
 		vmx_destroy_pml_buffer(vmx);
 	free_vpid(vmx->vpid);
@@ -8253,8 +8071,6 @@ static int vmx_vcpu_create(struct kvm_vcpu *vcpu)
 			   __pa(&vmx->pi_desc) | PID_TABLE_ENTRY_VALID);
 	vmx->eli.host_idt.address = 0;
 	vmx->eli.enabled = false;
-	vmx->posted_interrupts.enabled = false;
-	vmx->posted_interrupts.notif_vector_gpa = 0;
 	return 0;
 
 free_vmcs:
@@ -9029,33 +8845,7 @@ static struct kvm_x86_ops vmx_x86_ops __initdata = {
 
 	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
 	.eli_remap_vector = vmx_eli_remap_vector,
-	.send_posted_interrupt =  vmx_send_posted_interrupt,
-	.has_posted_interrupts = vmx_has_posted_interrupts,
 };
-
-static void pvpi_host_intr(void) {
-	int cpu = raw_smp_processor_id();
-	struct vcpu_vmx *vmx = pvpi_vmxs[cpu];
-	if (!vmx) {
-		printk(KERN_WARNING  "kvm-eli: posted interrupt delivered to host but no vmx was found for processor %d", cpu);
-		return;
-	}
-
-	kvm_resend_interrupt(&vmx->vcpu,
-				vmx->posted_interrupts.injected_delivery_mode,
-				vmx->posted_interrupts.injected_vector,
-				vmx->posted_interrupts.injected_level,
-				vmx->posted_interrupts.injected_trig_mode);
-        *(vmx->posted_interrupts.shared_descriptor) = -1;
-}
-static void pvpi_set_handler(void) {
-	posted_interrupt_handler = pvpi_host_intr;
-}
-
-static void pvpi_unset_handler(void) {
-	posted_interrupt_handler = NULL;
-}
-
 
 static unsigned int vmx_handle_intel_pt_intr(void)
 {
@@ -9340,7 +9130,6 @@ static void vmx_cleanup_l1d_flush(void)
 
 static void vmx_exit(void)
 {
-	pvpi_unset_handler();
 #ifdef CONFIG_KEXEC_CORE
 	RCU_INIT_POINTER(crash_vmclear_loaded_vmcss, NULL);
 	synchronize_rcu();
@@ -9453,7 +9242,6 @@ static int __init vmx_init(void)
 	 */
 	if (!enable_ept)
 		allow_smaller_maxphyaddr = true;
-	pvpi_set_handler();
 	return 0;
 }
 module_init(vmx_init);

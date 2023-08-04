@@ -1429,7 +1429,6 @@ struct kvm_vcpu_stat {
 	u64 preemption_other;
 	u64 guest_mode;
 	u64 notify_window_exits;
-	u32 elvis_injections;
 };
 
 struct x86_instruction_info;
@@ -1556,7 +1555,6 @@ struct kvm_x86_ops {
 	void (*set_apic_access_page_addr)(struct kvm_vcpu *vcpu);
 	void (*deliver_interrupt)(struct kvm_lapic *apic, int delivery_mode,
 				  int trig_mode, int vector);
-	//int (*has_posted_interrupts)(struct kvm_vcpu *vcpu);
 	int (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
 	int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
 	int (*set_identity_map_addr)(struct kvm *kvm, u64 ident_addr);
@@ -1646,9 +1644,6 @@ struct kvm_x86_ops {
 	unsigned long (*vcpu_get_apicv_inhibit_reasons)(struct kvm_vcpu *vcpu);
 
 	void (*eli_remap_vector)(struct kvm_vcpu *vcpu, int guest_vector, int host_irq);
-	int (*send_posted_interrupt)(struct kvm_vcpu *vcpu, int delivery_mode,
-					int vector, int level, int trig_mode);
-	int (*has_posted_interrupts)(struct kvm_vcpu *vcpu);
 };
 
 struct kvm_x86_nested_ops {

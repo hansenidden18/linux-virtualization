@@ -28,8 +28,21 @@
 #include <asm/irq.h>
 #include <asm/sections.h>
 
-extern void posted_interrupt(void);
+static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
+{
+	struct tick_sched *ts =
+		this_cpu_ptr(&tick_cpu_sched);
+	
+	if (ts->inidle)
+		do_tick();
+	/* No need to reprogram if we are in idle or full dynticks mode */
+	//if (unlikely(ts->tick_stopped))
+	//	return HRTIMER_NORESTART;
 
+	//hrtimer_forward(timer, now, TICK_NSEC);
+
+	return HRTIMER_NORESTART;
+}
 #ifdef	CONFIG_X86_LOCAL_APIC
 struct irq_data;
 struct pci_dev;
@@ -132,7 +145,6 @@ extern char spurious_entries_start[];
 typedef struct irq_desc* vector_irq_t[NR_VECTORS];
 DECLARE_PER_CPU(vector_irq_t, vector_irq);
 
-extern void (*posted_interrupt_handler)(void);
 #endif /* !ASSEMBLY_ */
 
 #endif /* _ASM_X86_HW_IRQ_H */

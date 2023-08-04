@@ -293,7 +293,6 @@ const struct _kvm_stats_desc kvm_vcpu_stats_desc[] = {
 	STATS_DESC_COUNTER(VCPU, preemption_other),
 	STATS_DESC_IBOOLEAN(VCPU, guest_mode),
 	STATS_DESC_COUNTER(VCPU, notify_window_exits),
-	STATS_DESC_COUNTER(VCPU, elvis_injections),
 };
 
 const struct kvm_stats_header kvm_vcpu_stats_header = {
@@ -12983,36 +12982,6 @@ int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu)
 {
 	return kvm_vcpu_exiting_guest_mode(vcpu) == IN_GUEST_MODE;
 }
-
-int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
-			int vector, int level, int trig_mode) {
-	if (kvm_x86_ops.has_posted_interrupts(vcpu)) {
-		return kvm_x86_ops.send_posted_interrupt(vcpu, delivery_mode,
-						vector, level, trig_mode);
-	}
-	return 0;
-}
-
-int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
-			int vector, int level, int trig_mode) {
-	struct kvm_lapic_irq irq;
-
-	irq.delivery_mode = delivery_mode;
-	irq.vector = vector;
-	irq.level = level;
-	irq.trig_mode = trig_mode;
-
-	return kvm_apic_set_irq(vcpu, &irq, NULL);
-}
-EXPORT_SYMBOL_GPL(kvm_resend_interrupt);
-/*int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
-			int vector, int level, int trig_mode) {
-	if (kvm_x86_ops.has_posted_interrupts(vcpu)) {
-		return kvm_x86_ops.send_posted_interrupt(vcpu, delivery_mode,
-						vector, level, trig_mode);
-	}
-	return 0;
-}*/
 
 int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu)
 {
