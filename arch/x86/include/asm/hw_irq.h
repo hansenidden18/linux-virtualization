@@ -28,21 +28,6 @@
 #include <asm/irq.h>
 #include <asm/sections.h>
 
-static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
-{
-	struct tick_sched *ts =
-		this_cpu_ptr(&tick_cpu_sched);
-	
-	if (ts->inidle)
-		do_tick();
-	/* No need to reprogram if we are in idle or full dynticks mode */
-	//if (unlikely(ts->tick_stopped))
-	//	return HRTIMER_NORESTART;
-
-	//hrtimer_forward(timer, now, TICK_NSEC);
-
-	return HRTIMER_NORESTART;
-}
 #ifdef	CONFIG_X86_LOCAL_APIC
 struct irq_data;
 struct pci_dev;
