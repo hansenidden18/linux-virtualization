@@ -379,6 +379,7 @@ struct kvm_vcpu {
 	 */
 	struct kvm_memory_slot *last_used_slot;
 	u64 last_used_slot_gen;
+	ktime_t last_tick;
 };
 
 /*
@@ -1354,6 +1355,16 @@ void kvm_arch_vcpu_blocking(struct kvm_vcpu *vcpu);
 void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu);
 bool kvm_vcpu_wake_up(struct kvm_vcpu *vcpu);
 void kvm_vcpu_kick(struct kvm_vcpu *vcpu);
+int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
+int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
+
+int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
+
+int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode);
 int kvm_vcpu_yield_to(struct kvm_vcpu *target);
 void kvm_vcpu_on_spin(struct kvm_vcpu *vcpu, bool usermode_vcpu_not_eligible);
 
@@ -2027,6 +2038,9 @@ static inline int kvm_ioeventfd(struct kvm *kvm, struct kvm_ioeventfd *args)
 #endif /* CONFIG_HAVE_KVM_EVENTFD */
 
 void kvm_arch_irq_routing_update(struct kvm *kvm);
+
+void kvm_arch_eli_remap_vector(struct kvm *kvm,
+	int guest_vector, int host_vector);
 
 static inline void __kvm_make_request(int req, struct kvm_vcpu *vcpu)
 {

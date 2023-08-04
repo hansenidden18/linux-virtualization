@@ -26,8 +26,11 @@
 #include <linux/posix-timers.h>
 #include <linux/context_tracking.h>
 #include <linux/mm.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
 
 #include <asm/irq_regs.h>
+#include <asm/apic.h>
 
 #include "tick-internal.h"
 
@@ -757,23 +760,6 @@ EXPORT_SYMBOL_GPL(get_cpu_iowait_time_us);
 
 static void tick_nohz_restart(struct tick_sched *ts, ktime_t now)
 {
-	hrtimer_cancel(&ts->sched_timer);
-	hrtimer_set_expires(&ts->sched_timer, ts->last_tick);
-
-	/* Forward the time to expire in the future */
-	hrtimer_forward(&ts->sched_timer, now, TICK_NSEC);
-
-	if (ts->nohz_mode == NOHZ_MODE_HIGHRES) {
-		hrtimer_start_expires(&ts->sched_timer,
-				      HRTIMER_MODE_ABS_PINNED_HARD);
-	} else {
-		tick_program_event(hrtimer_get_expires(&ts->sched_timer), 1);
-	}
-
-	/*
-	 * Reset to make sure next tick stop doesn't get fooled by past
-	 * cached clock deadline.
-	 */
 	ts->next_tick = 0;
 }
 
@@ -925,14 +911,13 @@ static void tick_nohz_stop_tick(struct tick_sched *ts, int cpu)
 	 * the tick timer.
 	 */
 	if (unlikely(expires == KTIME_MAX)) {
-		if (ts->nohz_mode == NOHZ_MODE_HIGHRES)
-			hrtimer_cancel(&ts->sched_timer);
-		else
-			tick_program_event(KTIME_MAX, 1);
+		//tick_program_event(KTIME_MAX, 1);
 		return;
 	}
 
-	if (ts->nohz_mode == NOHZ_MODE_HIGHRES) {
+	if (ts->nohz_mode == NOHZ_MODE_HIGHRES
+	    && (!hrtimer_active(&ts->sched_timer)
+	    || hrtimer_get_expires(&ts->sched_timer) >= tick)) {
 		hrtimer_start(&ts->sched_timer, tick,
 			      HRTIMER_MODE_ABS_PINNED_HARD);
 	} else {
@@ -943,6 +928,19 @@ static void tick_nohz_stop_tick(struct tick_sched *ts, int cpu)
 
 static void tick_nohz_retain_tick(struct tick_sched *ts)
 {
+	ktime_t now, next_event;
+       
+	now = ktime_get();
+	
+	if (!hrtimer_active(&ts->sched_timer) || hrtimer_get_expires(&ts->sched_timer) > now + TICK_NSEC)
+	{
+		next_event = tick_nohz_next_event(ts, smp_processor_id());
+		if (next_event == 0)
+			hrtimer_start(&ts->sched_timer, now + TICK_NSEC, HRTIMER_MODE_ABS_PINNED_HARD);
+		else if (next_event < KTIME_MAX)
+			hrtimer_start(&ts->sched_timer, next_event, HRTIMER_MODE_ABS_PINNED_HARD);
+	}
+	
 	ts->timer_expires_base = 0;
 }
 
@@ -1459,6 +1457,19 @@ void tick_irq_enter(void)
  * High resolution timer specific code
  */
 #ifdef CONFIG_HIGH_RES_TIMERS
+
+static void do_tick(void)
+{
+	struct tick_sched* ts = this_cpu_ptr(&tick_cpu_sched);
+	struct pt_regs* regs = get_irq_regs();
+	ktime_t now = ktime_get();
+	tick_sched_do_timer(ts, now);
+	if (regs)
+                tick_sched_handle(ts, regs);
+        else
+                ts->next_tick = 0;
+}
+
 /*
  * We rearm the timer until we get disabled by the idle code.
  * Called with interrupts disabled.
@@ -1466,28 +1477,17 @@ void tick_irq_enter(void)
 static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 {
 	struct tick_sched *ts =
-		container_of(timer, struct tick_sched, sched_timer);
-	struct pt_regs *regs = get_irq_regs();
-	ktime_t now = ktime_get();
-
-	tick_sched_do_timer(ts, now);
-
-	/*
-	 * Do not call, when we are not in irq context and have
-	 * no valid regs pointer
-	 */
-	if (regs)
-		tick_sched_handle(ts, regs);
-	else
-		ts->next_tick = 0;
-
+		this_cpu_ptr(&tick_cpu_sched);
+	
+	if (ts->inidle)
+		do_tick();
 	/* No need to reprogram if we are in idle or full dynticks mode */
-	if (unlikely(ts->tick_stopped))
-		return HRTIMER_NORESTART;
+	//if (unlikely(ts->tick_stopped))
+	//	return HRTIMER_NORESTART;
 
-	hrtimer_forward(timer, now, TICK_NSEC);
+	//hrtimer_forward(timer, now, TICK_NSEC);
 
-	return HRTIMER_RESTART;
+	return HRTIMER_NORESTART;
 }
 
 static int sched_skew_tick;
@@ -1499,6 +1499,22 @@ static int __init skew_tick(char *str)
 	return 0;
 }
 early_param("skew_tick", skew_tick);
+
+void handle_paratick_irq(struct irq_desc* desc)
+{
+	do_tick();
+	ack_APIC_irq();
+}
+
+static struct irq_desc paratick_desc = {
+	.handle_irq = handle_paratick_irq
+};
+
+static void install_paratick_handler(void)
+{
+	struct irq_desc* (*descs)[256] = this_cpu_ptr(&vector_irq);
+	(*descs)[235] = &paratick_desc;	
+}
 
 /**
  * tick_setup_sched_timer - setup the tick emulation timer
@@ -1528,6 +1544,8 @@ void tick_setup_sched_timer(void)
 	hrtimer_forward(&ts->sched_timer, now, TICK_NSEC);
 	hrtimer_start_expires(&ts->sched_timer, HRTIMER_MODE_ABS_PINNED_HARD);
 	tick_nohz_activate(ts, NOHZ_MODE_HIGHRES);
+
+	install_paratick_handler();
 }
 #endif /* HIGH_RES_TIMERS */
 

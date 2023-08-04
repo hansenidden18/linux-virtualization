@@ -34,7 +34,6 @@ int kvm_irq_map_gsi(struct kvm *kvm,
 			++n;
 		}
 	}
-
 	return n;
 }
 

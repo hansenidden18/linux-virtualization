@@ -338,6 +338,69 @@ struct vcpu_vmx {
 	/* Support for a guest hypervisor (nested VMX) */
 	struct nested_vmx nested;
 
+	/* we need to change the x2apic msr bitmaps per vcpu thus
+	 * we can't use global bitmaps */
+	unsigned long *vmx_msr_bitmap_legacy_x2apic;
+	unsigned long *vmx_msr_bitmap_longmode_x2apic;
+	
+	struct {
+		/* IDTR used to run the guest when ELI is enabled.
+		 * This descriptor points to the shadow IDT (GVA).
+		 */
+		struct desc_ptr host_idt;
+		/* IDTR the guest believes it is using (GVA).
+		 */
+		struct desc_ptr guest_idt;
+		/* Guest physical address of the shadow IDT (note that
+		 * host_idt.address is the guest virtual address).
+		 */
+		gpa_t host_idt_gpa;
+		/* Indicates if ELI is enabled or not */
+		bool enabled;
+		
+		bool exitless_eoi;
+
+		bool inject_mode;
+
+		bool exit_handled;
+		/*
+		 * The guest and host use different vectors for the assigned
+		 * device interrupts. This field is used to remap the vectors
+		 * of the shadow IDT so they point to the corresponding
+		 * handler in the guest.
+		 */
+		int remap_gv_to_hirq[256];
+		int remap_gv_to_hv[256];
+	} eli;
+	struct {
+		/* Whether virtual interrupt injection via paravirtual
+		 * posted interrupts is enabled or not.
+		 */
+		bool enabled;
+		/* Address of guest variable which the host will fill with the
+		 * vector used for paravirtual posted interrupts (the guest
+		 * cannot currently control this choice).
+		 */
+		gpa_t notif_vector_gpa;
+		/* Address of a guest page (must be page aligned) in which the
+		 * host writes the vector being injected for each vcpu (one
+		 * u32_t per vcpu).
+		 */
+		gpa_t injected_vector_gpa;
+		/* Host page of injected_vector_gpa, and pointer directly
+		 * to this vcpu's vector being injected
+		 */
+		struct page *shared_descriptor_page;
+		int *shared_descriptor;
+		/* Data corresponding to the last vector injected via PV PI.
+		 * Required in case the IPI arrives in root mode and the
+		 * vector needs to be re-injected.
+		 */
+		int injected_vector;
+		int injected_delivery_mode;
+		int injected_level;
+		int injected_trig_mode;
+	} posted_interrupts;
 	/* Dynamic PLE window. */
 	unsigned int ple_window;
 	bool ple_window_dirty;

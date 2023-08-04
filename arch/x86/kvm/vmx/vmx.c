@@ -779,6 +779,7 @@ static u32 vmx_read_guest_seg_ar(struct vcpu_vmx *vmx, unsigned seg)
 void vmx_update_exception_bitmap(struct kvm_vcpu *vcpu)
 {
 	u32 eb;
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
 
 	eb = (1u << PF_VECTOR) | (1u << UD_VECTOR) | (1u << MC_VECTOR) |
 	     (1u << DB_VECTOR) | (1u << AC_VECTOR);
@@ -831,6 +832,12 @@ void vmx_update_exception_bitmap(struct kvm_vcpu *vcpu)
 	 */
 	if (vcpu->arch.xfd_no_write_intercept)
 		eb |= (1u << NM_VECTOR);
+
+	/* When in non-injection ELI mode, NP exceptions occur on external
+	 * interrupts not assigned to the guest, so should cause an exit.
+	 */
+	if (vmx->eli.enabled && !vmx->eli.inject_mode)
+		eb |= 1u << NP_VECTOR;
 
 	vmcs_write32(EXCEPTION_BITMAP, eb);
 }
@@ -3482,12 +3489,28 @@ static void vmx_get_cs_db_l_bits(struct kvm_vcpu *vcpu, int *db, int *l)
 
 static void vmx_get_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
 {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	/* if ELI is enabled returns the guest IDTR and not the shadow IDTR */
+	if (vmx->eli.enabled) {
+		dt->size = vmx->eli.guest_idt.size;
+		dt->address = vmx->eli.guest_idt.address;
+		return;
+	}
+
 	dt->size = vmcs_read32(GUEST_IDTR_LIMIT);
 	dt->address = vmcs_readl(GUEST_IDTR_BASE);
 }
 
 static void vmx_set_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
 {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	/* if ELI is enabled set the guest IDTR and not the shadow IDTR */
+	if (vmx->eli.enabled) {
+		vmx->eli.guest_idt.size = dt->size;
+		vmx->eli.guest_idt.address = dt->address;
+		return;
+	}
+
 	vmcs_write32(GUEST_IDTR_LIMIT, dt->size);
 	vmcs_writel(GUEST_IDTR_BASE, dt->address);
 }
@@ -4733,7 +4756,6 @@ static void __vmx_vcpu_reset(struct kvm_vcpu *vcpu)
 static void vmx_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
-
 	if (!init_event)
 		__vmx_vcpu_reset(vcpu);
 
@@ -4805,6 +4827,63 @@ static void vmx_enable_nmi_window(struct kvm_vcpu *vcpu)
 	exec_controls_setbit(to_vmx(vcpu), CPU_BASED_NMI_WINDOW_EXITING);
 }
 
+#define EOI_MSR (APIC_BASE_MSR + (APIC_EOI >> 4)) /* 0x80b */
+static inline void eli_eoi_exiting(struct vcpu_vmx *vmx, bool exiting) {
+	if (exiting)
+		vmx_enable_intercept_for_msr(&vmx->vcpu, EOI_MSR, MSR_TYPE_W);
+	else
+		vmx_disable_intercept_for_msr(&vmx->vcpu, EOI_MSR, MSR_TYPE_W);
+}
+
+/* Enables or disables ELI's injection mode. When injection mode is disabled
+ * the guest runs with normal ELI: the shadow IDT is used, and the CPU is
+ * configured to deliver interrupts directly into the guest without exit.
+ * When injection mode is enabled, the guest runs with the original guest IDT
+ * and the CPU is configured to exit on external interrupts. This mode is
+ * necessary for injecting virtual interrupts into the guest.
+ */
+static void eli_set_inject_mode(struct vcpu_vmx *vmx, bool inject_mode) {
+	struct desc_ptr *idt;
+	u32 pin_based_exec_ctrl, cpu_based_2nd_exec_ctrl;
+	if (inject_mode == vmx->eli.inject_mode) {
+		return;
+	}
+	vmx->eli.inject_mode = inject_mode;
+
+	pin_based_exec_ctrl = vmcs_read32(PIN_BASED_VM_EXEC_CONTROL);
+	cpu_based_2nd_exec_ctrl = vmcs_read32(SECONDARY_VM_EXEC_CONTROL);
+
+	if (inject_mode) {
+		/* Use the guest idt for guest mode execution */
+		idt = &vmx->eli.guest_idt;
+		/* Enable exit on external interrupts */
+		pin_based_exec_ctrl |= PIN_BASED_EXT_INTR_MASK;
+		/* No need to trap changes in the IDTR register */
+		cpu_based_2nd_exec_ctrl &= ~SECONDARY_EXEC_DESC;
+	} else {
+		/* use the shadow IDT for guest mode execution */
+		idt = &vmx->eli.host_idt;
+		/* Disable exit on external interrupts,
+		   (interrupts are delivered through the shadow idt) */
+		pin_based_exec_ctrl &= ~PIN_BASED_EXT_INTR_MASK;
+		/* Trap any attempt of the guest to change the IDTR register */
+		cpu_based_2nd_exec_ctrl |= SECONDARY_EXEC_DESC;
+	}
+
+	vmcs_write32(GUEST_IDTR_LIMIT, idt->size);
+	vmcs_writel(GUEST_IDTR_BASE, idt->address);
+	vmcs_write32(PIN_BASED_VM_EXEC_CONTROL,	pin_based_exec_ctrl);
+	vmcs_write32(SECONDARY_VM_EXEC_CONTROL, cpu_based_2nd_exec_ctrl);
+
+
+	/* Trap or don't trap NP exceptions, depending on injection mode */
+	vmx_update_exception_bitmap(&vmx->vcpu);
+
+	/* allow direct EOI access only if we don't run in injection mode */
+	if (vmx->eli.exitless_eoi)
+		eli_eoi_exiting(vmx, inject_mode);
+}
+
 static void vmx_inject_irq(struct kvm_vcpu *vcpu, bool reinjected)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -4829,6 +4908,11 @@ static void vmx_inject_irq(struct kvm_vcpu *vcpu, bool reinjected)
 	} else
 		intr |= INTR_TYPE_EXT_INTR;
 	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD, intr);
+	/* In ELI, we must enter injection mode before we can inject a
+	 * virtual interrupt.
+	 */
+	if (vmx->eli.enabled)
+		eli_set_inject_mode(vmx, true);
 
 	vmx_clear_hlt(vcpu);
 }
@@ -5063,7 +5147,13 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 	u32 intr_info, ex_no, error_code;
 	unsigned long cr2, dr6;
 	u32 vect_info;
-
+	
+	if (vmx->eli.exit_handled) {
+		/* This is an NP exception (caused by non-assigned interrupt)
+		 * already handled by ELI in eli_complete_interrupts() */
+		return 1;
+	}
+	
 	vect_info = vmx->idt_vectoring_info;
 	intr_info = vmx_get_intr_info(vcpu);
 
@@ -5311,11 +5401,11 @@ static int handle_set_cr4(struct kvm_vcpu *vcpu, unsigned long val)
 		return kvm_set_cr4(vcpu, val);
 }
 
-static int handle_desc(struct kvm_vcpu *vcpu)
-{
-	WARN_ON(!(vcpu->arch.cr4 & X86_CR4_UMIP));
-	return kvm_emulate_instruction(vcpu, 0);
-}
+//static int handle_desc(struct kvm_vcpu *vcpu)
+//{
+//	WARN_ON(!(vcpu->arch.cr4 & X86_CR4_UMIP));
+//	return kvm_emulate_instruction(vcpu, 0);
+//}
 
 static int handle_cr(struct kvm_vcpu *vcpu)
 {
@@ -5500,6 +5590,785 @@ static int handle_interrupt_window(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+/* Generate a software interrupt. Unfortunately, x86 does not have a generic
+ * interrupt instruction taking a register or memory operand - each interrupt
+ * has a different opcode. This is why the following code is so repetitive...
+ *
+ * NOTE: Unlike a normal device interrupt, a software interrupt will be
+ * handled immediatly because software interrupts cannot be masked by IF.
+ * Pros: higher interrupt generated later would not be processed before this one
+ * Cons: the kvm/linux flow for handling external interrupts is altered
+ * We can also use self IPIs instead of software interrupt:
+ *	ack_APIC_irq();
+ *	apic->send_IPI_self(intr);
+ * In this case, the
+ * handling will be deferred until the host enables interrupts.
+ * Pros: the kvm/linux handling flow is not altered. No repetitive code :-)
+ * Cons: higher interrupts generated after can be processed before this one.
+ */
+static inline int software_intr(int intr)
+{
+	switch (intr) {
+	case 32: asm volatile("int $32" : : : "memory"); break;
+	case 33: asm volatile("int $33" : : : "memory"); break;
+	case 34: asm volatile("int $34" : : : "memory"); break;
+	case 35: asm volatile("int $35" : : : "memory"); break;
+	case 36: asm volatile("int $36" : : : "memory"); break;
+	case 37: asm volatile("int $37" : : : "memory"); break;
+	case 38: asm volatile("int $38" : : : "memory"); break;
+	case 39: asm volatile("int $39" : : : "memory"); break;
+	case 40: asm volatile("int $40" : : : "memory"); break;
+	case 41: asm volatile("int $41" : : : "memory"); break;
+	case 42: asm volatile("int $42" : : : "memory"); break;
+	case 43: asm volatile("int $43" : : : "memory"); break;
+	case 44: asm volatile("int $44" : : : "memory"); break;
+	case 45: asm volatile("int $45" : : : "memory"); break;
+	case 46: asm volatile("int $46" : : : "memory"); break;
+	case 47: asm volatile("int $47" : : : "memory"); break;
+	case 48: asm volatile("int $48" : : : "memory"); break;
+	case 49: asm volatile("int $49" : : : "memory"); break;
+	case 50: asm volatile("int $50" : : : "memory"); break;
+	case 51: asm volatile("int $51" : : : "memory"); break;
+	case 52: asm volatile("int $52" : : : "memory"); break;
+	case 53: asm volatile("int $53" : : : "memory"); break;
+	case 54: asm volatile("int $54" : : : "memory"); break;
+	case 55: asm volatile("int $55" : : : "memory"); break;
+	case 56: asm volatile("int $56" : : : "memory"); break;
+	case 57: asm volatile("int $57" : : : "memory"); break;
+	case 58: asm volatile("int $58" : : : "memory"); break;
+	case 59: asm volatile("int $59" : : : "memory"); break;
+	case 60: asm volatile("int $60" : : : "memory"); break;
+	case 61: asm volatile("int $61" : : : "memory"); break;
+	case 62: asm volatile("int $62" : : : "memory"); break;
+	case 63: asm volatile("int $63" : : : "memory"); break;
+	case 64: asm volatile("int $64" : : : "memory"); break;
+	case 65: asm volatile("int $65" : : : "memory"); break;
+	case 66: asm volatile("int $66" : : : "memory"); break;
+	case 67: asm volatile("int $67" : : : "memory"); break;
+	case 68: asm volatile("int $68" : : : "memory"); break;
+	case 69: asm volatile("int $69" : : : "memory"); break;
+	case 70: asm volatile("int $70" : : : "memory"); break;
+	case 71: asm volatile("int $71" : : : "memory"); break;
+	case 72: asm volatile("int $72" : : : "memory"); break;
+	case 73: asm volatile("int $73" : : : "memory"); break;
+	case 74: asm volatile("int $74" : : : "memory"); break;
+	case 75: asm volatile("int $75" : : : "memory"); break;
+	case 76: asm volatile("int $76" : : : "memory"); break;
+	case 77: asm volatile("int $77" : : : "memory"); break;
+	case 78: asm volatile("int $78" : : : "memory"); break;
+	case 79: asm volatile("int $79" : : : "memory"); break;
+	case 80: asm volatile("int $80" : : : "memory"); break;
+	case 81: asm volatile("int $81" : : : "memory"); break;
+	case 82: asm volatile("int $82" : : : "memory"); break;
+	case 83: asm volatile("int $83" : : : "memory"); break;
+	case 84: asm volatile("int $84" : : : "memory"); break;
+	case 85: asm volatile("int $85" : : : "memory"); break;
+	case 86: asm volatile("int $86" : : : "memory"); break;
+	case 87: asm volatile("int $87" : : : "memory"); break;
+	case 88: asm volatile("int $88" : : : "memory"); break;
+	case 89: asm volatile("int $89" : : : "memory"); break;
+	case 90: asm volatile("int $90" : : : "memory"); break;
+	case 91: asm volatile("int $91" : : : "memory"); break;
+	case 92: asm volatile("int $92" : : : "memory"); break;
+	case 93: asm volatile("int $93" : : : "memory"); break;
+	case 94: asm volatile("int $94" : : : "memory"); break;
+	case 95: asm volatile("int $95" : : : "memory"); break;
+	case 96: asm volatile("int $96" : : : "memory"); break;
+	case 97: asm volatile("int $97" : : : "memory"); break;
+	case 98: asm volatile("int $98" : : : "memory"); break;
+	case 99: asm volatile("int $99" : : : "memory"); break;
+	case 100: asm volatile("int $100" : : : "memory"); break;
+	case 101: asm volatile("int $101" : : : "memory"); break;
+	case 102: asm volatile("int $102" : : : "memory"); break;
+	case 103: asm volatile("int $103" : : : "memory"); break;
+	case 104: asm volatile("int $104" : : : "memory"); break;
+	case 105: asm volatile("int $105" : : : "memory"); break;
+	case 106: asm volatile("int $106" : : : "memory"); break;
+	case 107: asm volatile("int $107" : : : "memory"); break;
+	case 108: asm volatile("int $108" : : : "memory"); break;
+	case 109: asm volatile("int $109" : : : "memory"); break;
+	case 110: asm volatile("int $110" : : : "memory"); break;
+	case 111: asm volatile("int $111" : : : "memory"); break;
+	case 112: asm volatile("int $112" : : : "memory"); break;
+	case 113: asm volatile("int $113" : : : "memory"); break;
+	case 114: asm volatile("int $114" : : : "memory"); break;
+	case 115: asm volatile("int $115" : : : "memory"); break;
+	case 116: asm volatile("int $116" : : : "memory"); break;
+	case 117: asm volatile("int $117" : : : "memory"); break;
+	case 118: asm volatile("int $118" : : : "memory"); break;
+	case 119: asm volatile("int $119" : : : "memory"); break;
+	case 120: asm volatile("int $120" : : : "memory"); break;
+	case 121: asm volatile("int $121" : : : "memory"); break;
+	case 122: asm volatile("int $122" : : : "memory"); break;
+	case 123: asm volatile("int $123" : : : "memory"); break;
+	case 124: asm volatile("int $124" : : : "memory"); break;
+	case 125: asm volatile("int $125" : : : "memory"); break;
+	case 126: asm volatile("int $126" : : : "memory"); break;
+	case 127: asm volatile("int $127" : : : "memory"); break;
+	case 128: asm volatile("int $128" : : : "memory"); break;
+	case 129: asm volatile("int $129" : : : "memory"); break;
+	case 130: asm volatile("int $130" : : : "memory"); break;
+	case 131: asm volatile("int $131" : : : "memory"); break;
+	case 132: asm volatile("int $132" : : : "memory"); break;
+	case 133: asm volatile("int $133" : : : "memory"); break;
+	case 134: asm volatile("int $134" : : : "memory"); break;
+	case 135: asm volatile("int $135" : : : "memory"); break;
+	case 136: asm volatile("int $136" : : : "memory"); break;
+	case 137: asm volatile("int $137" : : : "memory"); break;
+	case 138: asm volatile("int $138" : : : "memory"); break;
+	case 139: asm volatile("int $139" : : : "memory"); break;
+	case 140: asm volatile("int $140" : : : "memory"); break;
+	case 141: asm volatile("int $141" : : : "memory"); break;
+	case 142: asm volatile("int $142" : : : "memory"); break;
+	case 143: asm volatile("int $143" : : : "memory"); break;
+	case 144: asm volatile("int $144" : : : "memory"); break;
+	case 145: asm volatile("int $145" : : : "memory"); break;
+	case 146: asm volatile("int $146" : : : "memory"); break;
+	case 147: asm volatile("int $147" : : : "memory"); break;
+	case 148: asm volatile("int $148" : : : "memory"); break;
+	case 149: asm volatile("int $149" : : : "memory"); break;
+	case 150: asm volatile("int $150" : : : "memory"); break;
+	case 151: asm volatile("int $151" : : : "memory"); break;
+	case 152: asm volatile("int $152" : : : "memory"); break;
+	case 153: asm volatile("int $153" : : : "memory"); break;
+	case 154: asm volatile("int $154" : : : "memory"); break;
+	case 155: asm volatile("int $155" : : : "memory"); break;
+	case 156: asm volatile("int $156" : : : "memory"); break;
+	case 157: asm volatile("int $157" : : : "memory"); break;
+	case 158: asm volatile("int $158" : : : "memory"); break;
+	case 159: asm volatile("int $159" : : : "memory"); break;
+	case 160: asm volatile("int $160" : : : "memory"); break;
+	case 161: asm volatile("int $161" : : : "memory"); break;
+	case 162: asm volatile("int $162" : : : "memory"); break;
+	case 163: asm volatile("int $163" : : : "memory"); break;
+	case 164: asm volatile("int $164" : : : "memory"); break;
+	case 165: asm volatile("int $165" : : : "memory"); break;
+	case 166: asm volatile("int $166" : : : "memory"); break;
+	case 167: asm volatile("int $167" : : : "memory"); break;
+	case 168: asm volatile("int $168" : : : "memory"); break;
+	case 169: asm volatile("int $169" : : : "memory"); break;
+	case 170: asm volatile("int $170" : : : "memory"); break;
+	case 171: asm volatile("int $171" : : : "memory"); break;
+	case 172: asm volatile("int $172" : : : "memory"); break;
+	case 173: asm volatile("int $173" : : : "memory"); break;
+	case 174: asm volatile("int $174" : : : "memory"); break;
+	case 175: asm volatile("int $175" : : : "memory"); break;
+	case 176: asm volatile("int $176" : : : "memory"); break;
+	case 177: asm volatile("int $177" : : : "memory"); break;
+	case 178: asm volatile("int $178" : : : "memory"); break;
+	case 179: asm volatile("int $179" : : : "memory"); break;
+	case 180: asm volatile("int $180" : : : "memory"); break;
+	case 181: asm volatile("int $181" : : : "memory"); break;
+	case 182: asm volatile("int $182" : : : "memory"); break;
+	case 183: asm volatile("int $183" : : : "memory"); break;
+	case 184: asm volatile("int $184" : : : "memory"); break;
+	case 185: asm volatile("int $185" : : : "memory"); break;
+	case 186: asm volatile("int $186" : : : "memory"); break;
+	case 187: asm volatile("int $187" : : : "memory"); break;
+	case 188: asm volatile("int $188" : : : "memory"); break;
+	case 189: asm volatile("int $189" : : : "memory"); break;
+	case 190: asm volatile("int $190" : : : "memory"); break;
+	case 191: asm volatile("int $191" : : : "memory"); break;
+	case 192: asm volatile("int $192" : : : "memory"); break;
+	case 193: asm volatile("int $193" : : : "memory"); break;
+	case 194: asm volatile("int $194" : : : "memory"); break;
+	case 195: asm volatile("int $195" : : : "memory"); break;
+	case 196: asm volatile("int $196" : : : "memory"); break;
+	case 197: asm volatile("int $197" : : : "memory"); break;
+	case 198: asm volatile("int $198" : : : "memory"); break;
+	case 199: asm volatile("int $199" : : : "memory"); break;
+	case 200: asm volatile("int $200" : : : "memory"); break;
+	case 201: asm volatile("int $201" : : : "memory"); break;
+	case 202: asm volatile("int $202" : : : "memory"); break;
+	case 203: asm volatile("int $203" : : : "memory"); break;
+	case 204: asm volatile("int $204" : : : "memory"); break;
+	case 205: asm volatile("int $205" : : : "memory"); break;
+	case 206: asm volatile("int $206" : : : "memory"); break;
+	case 207: asm volatile("int $207" : : : "memory"); break;
+	case 208: asm volatile("int $208" : : : "memory"); break;
+	case 209: asm volatile("int $209" : : : "memory"); break;
+	case 210: asm volatile("int $210" : : : "memory"); break;
+	case 211: asm volatile("int $211" : : : "memory"); break;
+	case 212: asm volatile("int $212" : : : "memory"); break;
+	case 213: asm volatile("int $213" : : : "memory"); break;
+	case 214: asm volatile("int $214" : : : "memory"); break;
+	case 215: asm volatile("int $215" : : : "memory"); break;
+	case 216: asm volatile("int $216" : : : "memory"); break;
+	case 217: asm volatile("int $217" : : : "memory"); break;
+	case 218: asm volatile("int $218" : : : "memory"); break;
+	case 219: asm volatile("int $219" : : : "memory"); break;
+	case 220: asm volatile("int $220" : : : "memory"); break;
+	case 221: asm volatile("int $221" : : : "memory"); break;
+	case 222: asm volatile("int $222" : : : "memory"); break;
+	case 223: asm volatile("int $223" : : : "memory"); break;
+	case 224: asm volatile("int $224" : : : "memory"); break;
+	case 225: asm volatile("int $225" : : : "memory"); break;
+	case 226: asm volatile("int $226" : : : "memory"); break;
+	case 227: asm volatile("int $227" : : : "memory"); break;
+	case 228: asm volatile("int $228" : : : "memory"); break;
+	case 229: asm volatile("int $229" : : : "memory"); break;
+	case 230: asm volatile("int $230" : : : "memory"); break;
+	case 231: asm volatile("int $231" : : : "memory"); break;
+	case 232: asm volatile("int $232" : : : "memory"); break;
+	case 233: asm volatile("int $233" : : : "memory"); break;
+	case 234: asm volatile("int $234" : : : "memory"); break;
+	case 235: asm volatile("int $235" : : : "memory"); break;
+	case 236: asm volatile("int $236" : : : "memory"); break;
+	case 237: asm volatile("int $237" : : : "memory"); break;
+	case 238: asm volatile("int $238" : : : "memory"); break;
+	case 239: asm volatile("int $239" : : : "memory"); break;
+	case 240: asm volatile("int $240" : : : "memory"); break;
+	case 241: asm volatile("int $241" : : : "memory"); break;
+	case 242: asm volatile("int $242" : : : "memory"); break;
+	case 243: asm volatile("int $243" : : : "memory"); break;
+	case 244: asm volatile("int $244" : : : "memory"); break;
+	case 245: asm volatile("int $245" : : : "memory"); break;
+	case 246: asm volatile("int $246" : : : "memory"); break;
+	case 247: asm volatile("int $247" : : : "memory"); break;
+	case 248: asm volatile("int $248" : : : "memory"); break;
+	case 249: asm volatile("int $249" : : : "memory"); break;
+	case 250: asm volatile("int $250" : : : "memory"); break;
+	case 251: asm volatile("int $251" : : : "memory"); break;
+	case 252: asm volatile("int $252" : : : "memory"); break;
+	case 253: asm volatile("int $253" : : : "memory"); break;
+	case 254: asm volatile("int $254" : : : "memory"); break;
+	case 255: asm volatile("int $255" : : : "memory"); break;
+	default:
+		printk(KERN_ERR "kvm-eli %s : unexpected guest intr 0x%x\n",
+			__func__, (u32)intr);
+	}
+	return 0;
+}
+
+/* When ELI is enabled (not in inject mode) the VCPU runs using the
+   shadow IDT and phyisical interrupts not assigned to the guest
+   cause a EXIT_REASON_EXCEPTION_NMI (NP_EXCEPTION).
+   This function is used to convert the exception to a real
+   interrupt by executing a INT X instruction (software interrupt)
+*/
+static inline void recreate_intr(int intr) {
+	software_intr(intr);
+}
+
+/*
+ * Copy entry number "guest_vector" from the guest IDT to entry number
+ * "host_vector" in the shadow IDT.
+ */
+static void eli_copy_idt_entry(struct vcpu_vmx *vmx,
+			      int guest_vector, unsigned host_vector,
+			      bool setNotPresent) {
+	struct desc_struct idt_entry32;
+	gate_desc idt_entry64;
+	gva_t entry_addr;
+	struct x86_exception error;
+
+	/* 64 bit or 32 bit ? */
+	if (is_long_mode(&vmx->vcpu)) {
+		/* read guest idt entry */
+		entry_addr = vmx->eli.guest_idt.address +
+				guest_vector*sizeof(idt_entry64);
+		kvm_read_guest_virt(&vmx->vcpu,
+				    entry_addr, &idt_entry64,
+				    sizeof(idt_entry64), &error);
+		/* write shadow idt entry */
+		entry_addr = vmx->eli.host_idt.address +
+				host_vector*sizeof(idt_entry64);
+		if (setNotPresent)
+			idt_entry64.bits.p = 0;
+		kvm_write_guest_virt_system(&vmx->vcpu,
+					    entry_addr, &idt_entry64,
+					    sizeof(idt_entry64), &error);
+	} else {
+		/* read guest idt entry */
+		entry_addr = vmx->eli.guest_idt.address +
+				guest_vector*sizeof(idt_entry32);
+		kvm_read_guest_virt(&vmx->vcpu,
+				   entry_addr, &idt_entry32,
+				   sizeof(idt_entry32), &error);
+		/* write shadow idt entry */
+		entry_addr = vmx->eli.host_idt.address +
+				host_vector*sizeof(idt_entry32);
+		if (setNotPresent)
+			idt_entry32.p = 0;
+		kvm_write_guest_virt_system(&vmx->vcpu,
+					    entry_addr, &idt_entry32,
+					    sizeof(idt_entry32), &error);
+	}
+}
+
+
+static int pvpi_init(struct vcpu_vmx *vmx,
+			gva_t notif_vector, gva_t injected_vector) {
+	struct x86_exception err;
+	u32 vector;
+	struct kvm_vcpu *vcpu;
+	gpa_t notif_vector_gpa;
+	gpa_t injected_vector_gpa;
+	int i;
+	struct page *shared_page;
+	int *shared_descriptor;
+
+	notif_vector_gpa = vmx->vcpu.arch.mmu.gva_to_gpa(
+				&vmx->vcpu, notif_vector, 0, &err);
+	injected_vector_gpa = vmx->vcpu.arch.mmu.gva_to_gpa(
+				&vmx->vcpu, injected_vector, 0, &err);
+
+	shared_page = gfn_to_page(vmx->vcpu.kvm,
+				  injected_vector_gpa >> PAGE_SHIFT);
+
+	if (is_error_page(shared_page)) {
+			kvm_release_page_clean(shared_page);
+			printk(KERN_ERR "kvm-eli: error getting shared page!\n");
+			return 0;
+	}
+
+	shared_descriptor = kmap(shared_page);
+
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		struct vcpu_vmx *v = to_vmx(vcpu);
+		v->posted_interrupts.notif_vector_gpa = notif_vector_gpa;
+		v->posted_interrupts.injected_vector_gpa = injected_vector_gpa;
+		v->posted_interrupts.shared_descriptor_page = shared_page;
+		v->posted_interrupts.shared_descriptor =
+			shared_descriptor+vcpu->vcpu_id;
+		*(v->posted_interrupts.shared_descriptor) = -1;
+	}
+
+	vector = POSTED_INTERRUPT_VECTOR;
+	kvm_write_guest(vmx->vcpu.kvm,
+			vmx->posted_interrupts.notif_vector_gpa, &vector, 4);
+	return 1;
+}
+static void pvpi_release_descriptor(struct vcpu_vmx *vmx) {
+	struct page *shared_page;
+
+	if (!vmx->posted_interrupts.notif_vector_gpa) {
+		return;
+	}
+
+	shared_page = vmx->posted_interrupts.shared_descriptor_page;
+	kunmap(shared_page);
+	kvm_release_page_dirty(shared_page);
+	return;
+}
+
+/* Enable or disable exitless virtual interrupt injection, using paravirtual
+ * posted interrupts.
+ */
+static int enable_exitless_injection(struct vcpu_vmx *vmx, bool enabled) {
+	struct kvm_vcpu *vcpu;
+	int i;
+	bool setup_idt;
+
+	if (!vmx->posted_interrupts.notif_vector_gpa) {
+		return 0;
+	}
+
+	if (vmx->posted_interrupts.enabled == enabled) {
+		return 0;
+	}
+
+	setup_idt = true;
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		if (to_vmx(vcpu)->posted_interrupts.enabled &&
+				vcpu != &vmx->vcpu) {
+			setup_idt = false;
+			break;
+		}
+	}
+
+	if (setup_idt) {
+		eli_copy_idt_entry(vmx, POSTED_INTERRUPT_VECTOR, POSTED_INTERRUPT_VECTOR, !enabled /* true to set not present, false to set present */);
+	}
+
+	vmx->posted_interrupts.enabled = enabled;
+	*(vmx->posted_interrupts.shared_descriptor) = -1;
+	return 1;
+}
+
+#define MAX_CPUS 128
+static struct vcpu_vmx *pvpi_vmxs[MAX_CPUS];
+
+#define PVPI_FILTER_VECTOR 0xf0
+static int vmx_send_posted_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+ 				     int vector, int level, int trig_mode)
+{	
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int me;
+	int cpu;
+
+	if (!vmx->posted_interrupts.enabled) {
+		return 0;
+	}
+
+	/* Send paravirtual posted interrupt only if the guest is running, and,
+	 * for reasons explained above, vector is below PVPI_FILTER_VECTOR.
+	 * We don't mind if right after we check, the guest exits - at worst
+	 * the IPI will arrive at the host and we have a handler to.
+	 * TODO: consider also the very unlikely case that the guest has time
+	 * to exit, and reenter a different guest, before we send the IPI.
+	 */
+	if (vmx->vcpu.mode != IN_GUEST_MODE || vector >= PVPI_FILTER_VECTOR)
+		return 0;
+
+	me = get_cpu();
+	cpu = vmx->vcpu.cpu;
+
+	/* send notification vector if different cpu and not pending vector */
+	if (cpu != me) {
+		int pending_vector;
+		/*
+		 * if *shared_descriptor == -1 then
+		 *      *shared_descriptor = vector
+		 *      pending_vector = -1
+		 * else
+		 *      *shared_descriptor is unchanged
+		 *      pending_vector = *shared_descriptor
+		 */		
+		pending_vector = cmpxchg(
+			vmx->posted_interrupts.shared_descriptor, -1, vector);
+
+		if (pending_vector == vector) {
+			put_cpu();
+			return 1;
+		}
+
+		if (pending_vector != -1) {
+			put_cpu();
+			return 0;
+		}
+
+		pvpi_vmxs[cpu] = vmx;
+
+		apic->send_IPI_mask(cpumask_of(cpu), POSTED_INTERRUPT_VECTOR);
+		++(vmx->vcpu.stat.elvis_injections);
+		vmx->posted_interrupts.injected_vector = vector;
+		vmx->posted_interrupts.injected_delivery_mode = delivery_mode;
+		vmx->posted_interrupts.injected_level = level;
+		vmx->posted_interrupts.injected_trig_mode = trig_mode;
+
+		put_cpu();
+		return 1;
+	} else {
+		vmx->posted_interrupts.injected_vector = -1;
+	}
+
+	put_cpu();
+	return 0;
+}
+
+static int vmx_has_posted_interrupts(struct kvm_vcpu *vcpu) {
+	return to_vmx(vcpu)->posted_interrupts.enabled;
+}
+
+/* eli_init initializes ELI (Exit-Less Interrupts) for this vcpu, by
+ * remembering the given location (GVA) for the shadow IDT.
+ * The contents (and size) of the shadow IDT will only be filled later,
+ * when ELI is enabled (see eli_enable()), based the guest's IDT and the
+ * interrupts we'll want to assign to the guest.
+ */
+static int eli_init(struct vcpu_vmx *vmx, gva_t host_idt_gva)
+{
+	struct x86_exception err;
+	gpa_t gpa;
+
+	if (host_idt_gva == 0) {
+		printk(KERN_ERR "kvm-eli: missing shadow IDT address\n");
+		return 0;
+	}
+	gpa = vmx->vcpu.arch.mmu->gva_to_gpa(&vmx->vcpu, vmx->vcpu.arch.mmu, host_idt_gva, 0, &err);
+	vmx->eli.host_idt_gpa = gpa;
+	vmx->eli.host_idt.address = host_idt_gva;
+	return 1;
+}
+
+/* eli_init for all the vcpus, assuming one shadow IDT for all */
+static void eli_init_all(struct vcpu_vmx *vmx, gva_t gva)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		eli_init(to_vmx(vcpu), gva);
+	}
+}
+
+static int irq_to_vector(unsigned host_irq) {
+	int v;
+	for (v = 0; v < 256; v++ ) {
+		struct irq_desc *desc = get_cpu_var(vector_irq)[v];
+		if (desc->irq_data.irq == host_irq)
+			return v;
+	}
+	return -1;
+}
+
+/* Remember to change the host-vector entry in the shadow IDT to point
+ * to the handler used by the entry guest-vector in the guest IDT once
+ * ELI is enabled.
+ */
+static void vmx_eli_remap_vector(struct kvm_vcpu *vcpu,
+					int guest_vector, int host_irq) {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int prev_host_vector, host_vector;
+
+	if (guest_vector<0 || guest_vector>=256 ||
+		host_irq<=0 || host_irq>=256){
+		return; /* shouldn't happen */
+	}
+
+	/* map the guest vector to the given host IRQ */
+	vmx->eli.remap_gv_to_hirq[guest_vector] = host_irq;
+
+	if (!vmx->eli.enabled) {
+		/*
+		 * The guest (shadow) IDT isn't yet set up, so we cannot set
+		 * up the right entries yet. We keep the mapping in the
+		 * remap_gv_to_hirq (above), and "replay" them in eli_remap().
+		 */
+		return;
+	}
+
+	/* if the vector was previouslly remapped restore the original entry */
+	prev_host_vector = vmx->eli.remap_gv_to_hv[guest_vector];
+	if (prev_host_vector)
+		eli_copy_idt_entry(vmx, prev_host_vector, prev_host_vector,
+					false);
+	/* remap the shadow idt */
+	host_vector = irq_to_vector(host_irq);
+	if (host_vector < 0) {
+		printk(KERN_ERR "kvm-eli: could not find vector for host irq = %d corresponding to guest vector=%d\n",
+		       host_irq, guest_vector);
+		return;
+	}
+
+	eli_copy_idt_entry(vmx, guest_vector, host_vector, false);
+	vmx->eli.remap_gv_to_hv[guest_vector] = host_vector;
+}
+/* Remap all the vectors saved by previous calls to vmx_eli_remap_vector. */
+static void eli_remap(struct vcpu_vmx *vmx) {
+	int i;
+	for (i=0; i<256; i++) {
+		if (vmx->eli.remap_gv_to_hirq[i]!=0)
+			vmx_eli_remap_vector(&vmx->vcpu, i,
+					vmx->eli.remap_gv_to_hirq[i]);
+	}
+}
+
+#define DI_IDT_VECTORS 256
+
+/* Enable ExitLess interrupt delivery */
+static int eli_enable(struct vcpu_vmx *vmx) {
+	unsigned long i;
+	bool setup_idt;
+	struct kvm_vcpu *vcpu;
+
+	if (vmx->eli.enabled) {
+		return 0;
+	}
+
+	/* ELI can not be enabled if it was not previouslly initialized */
+	if (!vmx->eli.host_idt.address) {
+		return 0;
+	}
+
+	/* keep the VMCS guest IDTR fields in-memory */
+	vmx_get_idt(&(vmx->vcpu), &vmx->eli.guest_idt);
+	/* set the shadow IDT size according to the guest IDT size */
+	vmx->eli.host_idt.size = vmx->eli.guest_idt.size;
+
+	/* setup idt if this is the first vcpu to enable eli */
+	setup_idt = true;
+	kvm_for_each_vcpu(i, vcpu, vmx->vcpu.kvm) {
+		if (to_vmx(vcpu)->eli.enabled) {
+			setup_idt = false;
+			break;
+		}
+	}
+	if (setup_idt) {
+		/* copy guest idt to shadow idt, but for all vectors used
+		   for external interrupts (>=32, !=0x80) set present=0 to
+		   cause an exit back to the host.
+		 */
+		for (i = 0; i < DI_IDT_VECTORS; i++)
+			eli_copy_idt_entry(vmx, i, i,
+			  i>=FIRST_EXTERNAL_VECTOR && i !=IA32_SYSCALL_VECTOR);
+	}
+	vmx->eli.enabled = true;
+	/* turn off injection off */
+	vmx->eli.inject_mode = true;
+	eli_set_inject_mode(vmx, false);
+	return 1;
+}
+
+/* disable ExitLess interrupt delivery */
+static int eli_disable(struct vcpu_vmx *vmx) {
+	if (vmx->eli.host_idt.size == 0) {
+		return 0;
+	}
+
+	/* set injection mode true and disable ELI */
+	eli_set_inject_mode(vmx, true);
+	vmx->eli.enabled = false;
+
+	return 1;
+}
+
+/* Handle accesses to the GDTR register. Used only when ELI is enabled */
+static int handle_gdtr_idtr(struct kvm_vcpu *vcpu) {
+	printk(KERN_WARNING "kvm-eli: unexpected GDTR/IDTR exit, disabling ELI\n");
+	eli_disable(to_vmx(vcpu));
+
+	return 1;
+}
+
+/* Handle accesses to the LDTR register. Used only when ELI is enabled */
+static int handle_ldtr_tr(struct kvm_vcpu *vcpu) {
+	printk(KERN_WARNING "kvm-eli: unexpected LDTR exit, temporary rollback to inject mode (vcpu=%d)\n",
+	       vcpu->vcpu_id);
+	eli_set_inject_mode(to_vmx(vcpu), true);
+
+	return 1;
+}
+
+int is_eoi(struct vcpu_vmx *vmx) {
+	/* check for x2APIC */
+	if (apic_x2apic_mode(vmx->vcpu.arch.apic))
+			/* check for x2APIC */
+		return vmx->exit_reason.basic == EXIT_REASON_MSR_WRITE &&
+			vmx->vcpu.arch.regs[VCPU_REGS_RCX] == EOI_MSR;
+
+	else
+	/* check for xAPIC */
+		return vmx->exit_reason.basic == EXIT_REASON_APIC_ACCESS &&
+			((vmcs_readl(EXIT_QUALIFICATION) & APIC_ACCESS_OFFSET)
+			 == APIC_EOI);
+}
+
+static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
+	vmx->eli.exit_handled = false;
+
+	if (vmx->eli.enabled) {
+		/* vmx->idt_vectoring_info tells us whether this exit happened
+		 * while the processor was reading the guest IDT for delivering
+		 * a certain interrupt vector. In ELI, this usually happens
+		 * when a non-present IDT entry was found (this is the way ELI
+		 * forces an exit on interrupts not assigned to the guest).
+		 * But rarely it happens for other reasons, e.g., page-fault
+		 * reading the IDT. In any case, we need to deliver this
+		 * interrupt in the host; If this is an assigned interrupt,
+		 * and the exit unnecessary, KVM will inject it into the guest.
+		 */
+		u32 type = vmx->idt_vectoring_info & VECTORING_INFO_TYPE_MASK;
+		u32 vector = vmx->idt_vectoring_info & VECTORING_INFO_VECTOR_MASK;
+		bool valid = vmx->idt_vectoring_info & VECTORING_INFO_VALID_MASK;
+		if (is_eoi(vmx)) {
+			/* disable injection mode after EOI to a previously
+			 * injected virtual interrupt */
+			if (vmx->eli.inject_mode)
+				eli_set_inject_mode(vmx, false);
+			else {
+				if (!vmx->posted_interrupts.enabled)
+				vmx->eli.exit_handled = true;
+			}
+		} else if (!vmx->eli.inject_mode && valid  && type == INTR_TYPE_EXT_INTR) {
+			recreate_intr(vector);
+			vmx->eli.exit_handled = true;
+			/* Note we do NOT acknowledge (ack_APIC_irq()) the
+			 * interrupt in this case, because Linux's interrupt
+			 * handler will do this when handling the interrupt we
+			 * rethrew it
+			 */
+			return 1;
+		}
+
+		/* Always acknowledge any pending interrupt that might have
+		 * been delivered during guest mode execution.
+		 * We could omit this and do it only for APIC accesses, but
+		 * this is risky for the host if the guest forgets to EOI
+		 * or crashes.
+		 */
+		ack_APIC_irq();
+	}
+
+	return 0;
+}
+
+#define DI_INITIALIZE             300
+
+/* hypercalls used to start/stop ExitLess interrupt completion (EOI) */
+#define DI_START_EOI             1101
+#define DI_STOP_EOI              1201
+#define PI_INITIALIZE		 2000
+#define PI_START                 2100
+#define PI_STOP                  2200
+/* hypercalls used to start/stop ExitLess interrupt delivery */
+#define DI_START                  500
+#define DI_STOP                   600
+
+
+static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	unsigned long vmcall_id = kvm_register_read(vcpu, VCPU_REGS_RAX);
+	switch (vmcall_id) {
+	case DI_INITIALIZE:
+		eli_init_all(vmx,
+			(gva_t) kvm_register_read(&vmx->vcpu, VCPU_REGS_RBX));
+		break;
+	case DI_START:
+		/* enable ExitLess interrupt delivery and remap guest/host vectors */
+		eli_enable(vmx);
+		eli_remap(vmx);
+		break;
+	case DI_STOP:
+		/* disable ExitLess interrupt delivery */
+		eli_disable(vmx);
+		break;
+	case DI_START_EOI:
+		/* enable ExitLess interrupt completion */
+		if (!irqchip_in_kernel(vcpu->kvm) ||
+			!apic_x2apic_mode(vcpu->arch.apic)) {
+			printk(KERN_WARNING "kvm-eli: Can't enable Exitless EOI: no x2APIC\n");
+		} else {
+			vmx->eli.exitless_eoi = true;
+			eli_eoi_exiting(vmx, vmx->eli.inject_mode);
+		}
+		break;
+	case DI_STOP_EOI:
+		/* disable ExitLess interrupt completion */
+		if (vmx->eli.exitless_eoi) {
+			eli_eoi_exiting(vmx, true);
+			vmx->eli.exitless_eoi = false;
+		}
+		break;
+	case PI_INITIALIZE:
+		pvpi_init(vmx,
+			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RBX),
+			(gva_t)kvm_register_read(vcpu, VCPU_REGS_RCX));
+		break;
+	case PI_START:
+		enable_exitless_injection(vmx, true);
+		break;
+	case PI_STOP:
+		enable_exitless_injection(vmx, false);			
+		break;
+	default:
+		return 0; /* hypercall was not handled here */
+		break;
+	}
+	return 1;
+}
+
+static int handle_vmcall(struct kvm_vcpu *vcpu)
+{
+	skip_emulated_instruction(vcpu);
+	if (eli_handle_vmcall(vcpu))
+		return 1;
+	kvm_emulate_hypercall(vcpu);
+	return 1;
+}
+
 static int handle_invlpg(struct kvm_vcpu *vcpu)
 {
 	unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
@@ -5510,6 +6379,14 @@ static int handle_invlpg(struct kvm_vcpu *vcpu)
 
 static int handle_apic_access(struct kvm_vcpu *vcpu)
 {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	/* check if ELI already handled the EOI */
+	if (vmx->eli.enabled && vmx->eli.exit_handled) {
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
+
 	if (likely(fasteoi)) {
 		unsigned long exit_qualification = vmx_get_exit_qual(vcpu);
 		int access_type, offset;
@@ -5972,7 +6849,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
 	[EXIT_REASON_INVLPG]		      = handle_invlpg,
 	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
-	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
+	[EXIT_REASON_VMCALL]                  = handle_vmcall,
 	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
 	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
 	[EXIT_REASON_VMPTRLD]		      = handle_vmx_instruction,
@@ -5990,8 +6867,8 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
 	[EXIT_REASON_XSETBV]                  = kvm_emulate_xsetbv,
 	[EXIT_REASON_TASK_SWITCH]             = handle_task_switch,
 	[EXIT_REASON_MCE_DURING_VMENTRY]      = handle_machine_check,
-	[EXIT_REASON_GDTR_IDTR]		      = handle_desc,
-	[EXIT_REASON_LDTR_TR]		      = handle_desc,
+	[EXIT_REASON_GDTR_IDTR]		      = handle_gdtr_idtr,
+	[EXIT_REASON_LDTR_TR]		      = handle_ldtr_tr,
 	[EXIT_REASON_EPT_VIOLATION]	      = handle_ept_violation,
 	[EXIT_REASON_EPT_MISCONFIG]           = handle_ept_misconfig,
 	[EXIT_REASON_PAUSE_INSTRUCTION]       = handle_pause,
@@ -6571,8 +7448,7 @@ void vmx_set_virtual_apic_mode(struct kvm_vcpu *vcpu)
 	if (!lapic_in_kernel(vcpu))
 		return;
 
-	if (!flexpriority_enabled &&
-	    !cpu_has_vmx_virtualize_x2apic_mode())
+	if (!cpu_has_vmx_virtualize_x2apic_mode())
 		return;
 
 	/* Postpone execution until vmcs01 is the current VMCS. */
@@ -7099,6 +7975,7 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	unsigned long cr3, cr4;
+	u32 exit_intr_info;
 
 	/* Record the guest's net vcpu time for enforced NMI injections. */
 	if (unlikely(!enable_vnmi &&
@@ -7230,7 +8107,7 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 
 		vmx->nested.nested_run_pending = 0;
 	}
-
+	
 	vmx->idt_vectoring_info = 0;
 
 	if (unlikely(vmx->fail)) {
@@ -7252,6 +8129,13 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 
 	vmx->loaded_vmcs->launched = 1;
 
+	exit_intr_info = vmx_get_intr_info(&vmx->vcpu);
+
+	/* handle ELI related exits */
+	if(eli_complete_interrupts(vmx, exit_intr_info)){
+		vmx->idt_vectoring_info = 0;
+	}
+
 	vmx_recover_nmi_blocking(vmx);
 	vmx_complete_interrupts(vmx);
 
@@ -7264,7 +8148,8 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 static void vmx_vcpu_free(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
-
+	if (vcpu->vcpu_id == 0)
+		pvpi_release_descriptor(vmx);
 	if (enable_pml)
 		vmx_destroy_pml_buffer(vmx);
 	free_vpid(vmx->vpid);
@@ -7366,7 +8251,10 @@ static int vmx_vcpu_create(struct kvm_vcpu *vcpu)
 	if (vmx_can_use_ipiv(vcpu))
 		WRITE_ONCE(to_kvm_vmx(vcpu->kvm)->pid_table[vcpu->vcpu_id],
 			   __pa(&vmx->pi_desc) | PID_TABLE_ENTRY_VALID);
-
+	vmx->eli.host_idt.address = 0;
+	vmx->eli.enabled = false;
+	vmx->posted_interrupts.enabled = false;
+	vmx->posted_interrupts.notif_vector_gpa = 0;
 	return 0;
 
 free_vmcs:
@@ -8140,7 +9028,34 @@ static struct kvm_x86_ops vmx_x86_ops __initdata = {
 	.complete_emulated_msr = kvm_complete_insn_gp,
 
 	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
+	.eli_remap_vector = vmx_eli_remap_vector,
+	.send_posted_interrupt =  vmx_send_posted_interrupt,
+	.has_posted_interrupts = vmx_has_posted_interrupts,
 };
+
+static void pvpi_host_intr(void) {
+	int cpu = raw_smp_processor_id();
+	struct vcpu_vmx *vmx = pvpi_vmxs[cpu];
+	if (!vmx) {
+		printk(KERN_WARNING  "kvm-eli: posted interrupt delivered to host but no vmx was found for processor %d", cpu);
+		return;
+	}
+
+	kvm_resend_interrupt(&vmx->vcpu,
+				vmx->posted_interrupts.injected_delivery_mode,
+				vmx->posted_interrupts.injected_vector,
+				vmx->posted_interrupts.injected_level,
+				vmx->posted_interrupts.injected_trig_mode);
+        *(vmx->posted_interrupts.shared_descriptor) = -1;
+}
+static void pvpi_set_handler(void) {
+	posted_interrupt_handler = pvpi_host_intr;
+}
+
+static void pvpi_unset_handler(void) {
+	posted_interrupt_handler = NULL;
+}
+
 
 static unsigned int vmx_handle_intel_pt_intr(void)
 {
@@ -8425,6 +9340,7 @@ static void vmx_cleanup_l1d_flush(void)
 
 static void vmx_exit(void)
 {
+	pvpi_unset_handler();
 #ifdef CONFIG_KEXEC_CORE
 	RCU_INIT_POINTER(crash_vmclear_loaded_vmcss, NULL);
 	synchronize_rcu();
@@ -8537,7 +9453,7 @@ static int __init vmx_init(void)
 	 */
 	if (!enable_ept)
 		allow_smaller_maxphyaddr = true;
-
+	pvpi_set_handler();
 	return 0;
 }
 module_init(vmx_init);

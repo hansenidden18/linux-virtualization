@@ -276,7 +276,7 @@ int vmx_pi_update_irte(struct kvm *kvm, unsigned int host_irq,
 	struct kvm_vcpu *vcpu;
 	struct vcpu_data vcpu_info;
 	int idx, ret = 0;
-
+	int guestv = 0;
 	if (!vmx_can_use_vtd_pi(kvm))
 		return 0;
 
@@ -292,6 +292,7 @@ int vmx_pi_update_irte(struct kvm *kvm, unsigned int host_irq,
 	hlist_for_each_entry(e, &irq_rt->map[guest_irq], link) {
 		if (e->type != KVM_IRQ_ROUTING_MSI)
 			continue;
+		guestv = irq.vector;
 		/*
 		 * VT-d PI cannot support posting multicast/broadcast
 		 * interrupts to a vCPU, we still use interrupt remapping
@@ -343,7 +344,7 @@ int vmx_pi_update_irte(struct kvm *kvm, unsigned int host_irq,
 			goto out;
 		}
 	}
-
+	kvm_arch_eli_remap_vector(kvm, guestv, host_irq);
 	ret = 0;
 out:
 	srcu_read_unlock(&kvm->irq_srcu, idx);

@@ -16,7 +16,7 @@ typedef struct {
 	unsigned int icr_read_retry_count;
 #endif
 #ifdef CONFIG_HAVE_KVM
-	unsigned int kvm_posted_intr_ipis;
+	//unsigned int kvm_posted_intr_ipis;
 	unsigned int kvm_posted_intr_wakeup_ipis;
 	unsigned int kvm_posted_intr_nested_ipis;
 #endif
@@ -28,6 +28,8 @@ typedef struct {
 	unsigned int irq_call_count;
 #endif
 	unsigned int irq_tlb_count;
+	unsigned int irq_eli_count;
+	unsigned int irq_eli_pis_count;
 #ifdef CONFIG_X86_THERMAL_VECTOR
 	unsigned int irq_thermal_count;
 #endif

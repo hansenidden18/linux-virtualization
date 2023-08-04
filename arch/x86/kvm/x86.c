@@ -30,6 +30,7 @@
 #include "hyperv.h"
 #include "lapic.h"
 #include "xen.h"
+#include "vmx/vmx.h"
 
 #include <linux/clocksource.h>
 #include <linux/interrupt.h>
@@ -292,6 +293,7 @@ const struct _kvm_stats_desc kvm_vcpu_stats_desc[] = {
 	STATS_DESC_COUNTER(VCPU, preemption_other),
 	STATS_DESC_IBOOLEAN(VCPU, guest_mode),
 	STATS_DESC_COUNTER(VCPU, notify_window_exits),
+	STATS_DESC_COUNTER(VCPU, elvis_injections),
 };
 
 const struct kvm_stats_header kvm_vcpu_stats_header = {
@@ -2043,7 +2045,11 @@ int kvm_emulate_wrmsr(struct kvm_vcpu *vcpu)
 	u32 ecx = kvm_rcx_read(vcpu);
 	u64 data = kvm_read_edx_eax(vcpu);
 	int r;
-
+	
+	if (to_vmx(vcpu)->eli.exit_handled) {
+		return kvm_skip_emulated_instruction(vcpu);
+	}
+	
 	r = kvm_set_msr_with_filter(vcpu, ecx, data);
 
 	if (!r) {
@@ -10950,11 +10956,18 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
 		!vcpu->arch.apf.halted);
 }
 
+static struct kvm_lapic_irq paratick_irq = {
+	.shorthand = APIC_DEST_SELF,
+	.dest_mode = APIC_DEST_PHYSICAL,
+	.delivery_mode = APIC_DM_FIXED,
+	.vector = 235,
+	.level = 15
+};
 /* Called within kvm->srcu read side.  */
 static int vcpu_run(struct kvm_vcpu *vcpu)
 {
 	int r;
-
+	ktime_t now;
 	vcpu->arch.l1tf_flush_l1d = true;
 
 	for (;;) {
@@ -10975,11 +10988,18 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 			break;
 
 		kvm_clear_request(KVM_REQ_UNBLOCK, vcpu);
+		
+		now = ktime_get();
 		if (kvm_xen_has_pending_events(vcpu))
 			kvm_xen_inject_pending_events(vcpu);
 
-		if (kvm_cpu_has_pending_timer(vcpu))
+		if (kvm_cpu_has_pending_timer(vcpu)) {
+			vcpu->last_tick = now;
 			kvm_inject_pending_timer_irqs(vcpu);
+		} else if (now - vcpu->last_tick > 4000000) {
+			vcpu->last_tick = now;
+			kvm_apic_set_irq(vcpu, &paratick_irq, NULL);
+		}
 
 		if (dm_request_for_irq_injection(vcpu) &&
 			kvm_vcpu_ready_for_interrupt_injection(vcpu)) {
@@ -11896,6 +11916,7 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.maxphyaddr = cpuid_query_maxphyaddr(vcpu);
 	vcpu->arch.reserved_gpa_bits = kvm_vcpu_reserved_gpa_bits_raw(vcpu);
+	vcpu->arch.cr3 = rsvd_bits(cpuid_maxphyaddr(vcpu), 63);
 
 	vcpu->arch.pat = MSR_IA32_CR_PAT_DEFAULT;
 
@@ -12978,6 +12999,36 @@ int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu)
 	return kvm_vcpu_exiting_guest_mode(vcpu) == IN_GUEST_MODE;
 }
 
+int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode) {
+	if (kvm_x86_ops.has_posted_interrupts(vcpu)) {
+		return kvm_x86_ops.send_posted_interrupt(vcpu, delivery_mode,
+						vector, level, trig_mode);
+	}
+	return 0;
+}
+
+int kvm_resend_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode) {
+	struct kvm_lapic_irq irq;
+
+	irq.delivery_mode = delivery_mode;
+	irq.vector = vector;
+	irq.level = level;
+	irq.trig_mode = trig_mode;
+
+	return kvm_apic_set_irq(vcpu, &irq, NULL);
+}
+EXPORT_SYMBOL_GPL(kvm_resend_interrupt);
+/*int kvm_send_interrupt(struct kvm_vcpu *vcpu, int delivery_mode,
+			int vector, int level, int trig_mode) {
+	if (kvm_x86_ops.has_posted_interrupts(vcpu)) {
+		return kvm_x86_ops.send_posted_interrupt(vcpu, delivery_mode,
+						vector, level, trig_mode);
+	}
+	return 0;
+}*/
+
 int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu)
 {
 	return static_call(kvm_x86_interrupt_allowed)(vcpu, false);
@@ -13726,6 +13777,17 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
+
+void kvm_arch_eli_remap_vector(struct kvm *kvm,
+	int guest_vector, int host_irq)
+{
+	unsigned long i;
+	struct kvm_vcpu *vcpu;
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		kvm_x86_ops.eli_remap_vector(vcpu, guest_vector, host_irq);
+	}
+}
+EXPORT_SYMBOL_GPL(kvm_arch_eli_remap_vector);
 
 static int __init kvm_x86_init(void)
 {
