@@ -10956,18 +10956,11 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
 		!vcpu->arch.apf.halted);
 }
 
-static struct kvm_lapic_irq paratick_irq = {
-	.shorthand = APIC_DEST_SELF,
-	.dest_mode = APIC_DEST_PHYSICAL,
-	.delivery_mode = APIC_DM_FIXED,
-	.vector = 235,
-	.level = 15
-};
 /* Called within kvm->srcu read side.  */
 static int vcpu_run(struct kvm_vcpu *vcpu)
 {
 	int r;
-	ktime_t now;
+
 	vcpu->arch.l1tf_flush_l1d = true;
 
 	for (;;) {
@@ -10988,18 +10981,11 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 			break;
 
 		kvm_clear_request(KVM_REQ_UNBLOCK, vcpu);
-		
-		now = ktime_get();
 		if (kvm_xen_has_pending_events(vcpu))
 			kvm_xen_inject_pending_events(vcpu);
 
-		if (kvm_cpu_has_pending_timer(vcpu)) {
-			vcpu->last_tick = now;
+		if (kvm_cpu_has_pending_timer(vcpu))
 			kvm_inject_pending_timer_irqs(vcpu);
-		} else if (now - vcpu->last_tick > 4000000) {
-			vcpu->last_tick = now;
-			kvm_apic_set_irq(vcpu, &paratick_irq, NULL);
-		}
 
 		if (dm_request_for_irq_injection(vcpu) &&
 			kvm_vcpu_ready_for_interrupt_injection(vcpu)) {
@@ -11916,7 +11902,6 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.maxphyaddr = cpuid_query_maxphyaddr(vcpu);
 	vcpu->arch.reserved_gpa_bits = kvm_vcpu_reserved_gpa_bits_raw(vcpu);
-	vcpu->arch.cr3 = rsvd_bits(cpuid_maxphyaddr(vcpu), 63);
 
 	vcpu->arch.pat = MSR_IA32_CR_PAT_DEFAULT;
 
