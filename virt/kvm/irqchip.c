@@ -202,11 +202,11 @@ static void kvm_remap_guest_host(struct kvm *kvm)
 	struct kvm_kernel_irqfd *irqfd;
 
 	spin_lock_irq(&kvm->irqfds.lock);
-	printk(KERN_WARN "kvm-eli: remapping guest to host\n");
+	printk(KERN_WARNING "kvm-eli: remapping guest to host\n");
 	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
 		remap_guest_host(irqfd->kvm, irqfd->gsi, irqfd->producer->irq);
 	}
-	printk(KERN_WARN "kvm-eli: remapping guest to host Succeed\n");
+	printk(KERN_WARNING "kvm-eli: remapping guest to host Succeed\n");
 	spin_unlock_irq(&kvm->irqfds.lock);
 }
 
@@ -264,7 +264,7 @@ int kvm_set_irq_routing(struct kvm *kvm,
 	old = rcu_dereference_protected(kvm->irq_routing, 1);
 	rcu_assign_pointer(kvm->irq_routing, new);
 	kvm_irq_routing_update(kvm);
-	remap_guest_host(kvm);
+	kvm_remap_guest_host(kvm);
 	kvm_arch_irq_routing_update(kvm);
 	mutex_unlock(&kvm->irq_lock);
 

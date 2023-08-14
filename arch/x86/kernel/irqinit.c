@@ -16,6 +16,7 @@
 #include <linux/acpi.h>
 #include <linux/io.h>
 #include <linux/delay.h>
+#include <linux/module.h>
 #include <linux/pgtable.h>
 
 #include <linux/atomic.h>
