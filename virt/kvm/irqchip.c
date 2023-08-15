@@ -165,51 +165,6 @@ bool __weak kvm_arch_can_set_irq_routing(struct kvm *kvm)
 	return true;
 }
 
-#include <linux/kvm_irqfd.h>
-static void remap_guest_host(struct kvm *kvm, int guest_irq, int host_irq){
-        int guestv;
-        struct kvm_irq_routing_table *irq_rt;
-        struct kvm_kernel_irq_routing_entry *e;
-        struct kvm_lapic_irq irq;
-        int idx;
-
-        /* Convert guest gsi into vector: */
-        idx = srcu_read_lock(&kvm->irq_srcu);
-        irq_rt = srcu_dereference(kvm->irq_routing, &kvm->irq_srcu);
-        if (guest_irq >= irq_rt->nr_rt_entries) {
-                return;
-        }
-        guestv=-1;
-        hlist_for_each_entry(e, &irq_rt->map[guest_irq], link)
-                if(e->type == KVM_IRQ_ROUTING_MSI){
-                        kvm_set_msi_irq(kvm, e, &irq);
-                        guestv= irq.vector;
-                }
-
-        srcu_read_unlock(&kvm->irq_srcu, idx);
-        if (guestv==-1) {
-                return;
-        }
-
-        /* Finally, found the host and guest vector. Remember this
-         * mapping
-         */
-        kvm_arch_eli_remap_vector(kvm, guestv, host_irq);
-}
-
-static void kvm_remap_guest_host(struct kvm *kvm)
-{
-	struct kvm_kernel_irqfd *irqfd;
-
-	spin_lock_irq(&kvm->irqfds.lock);
-	printk(KERN_WARNING "kvm-eli: remapping guest to host\n");
-	list_for_each_entry(irqfd, &kvm->irqfds.items, list) {
-		remap_guest_host(irqfd->kvm, irqfd->gsi, irqfd->producer->irq);
-	}
-	printk(KERN_WARNING "kvm-eli: remapping guest to host Succeed\n");
-	spin_unlock_irq(&kvm->irqfds.lock);
-}
-
 int kvm_set_irq_routing(struct kvm *kvm,
 			const struct kvm_irq_routing_entry *ue,
 			unsigned nr,
@@ -264,7 +219,6 @@ int kvm_set_irq_routing(struct kvm *kvm,
 	old = rcu_dereference_protected(kvm->irq_routing, 1);
 	rcu_assign_pointer(kvm->irq_routing, new);
 	kvm_irq_routing_update(kvm);
-	kvm_remap_guest_host(kvm);
 	kvm_arch_irq_routing_update(kvm);
 	mutex_unlock(&kvm->irq_lock);
 

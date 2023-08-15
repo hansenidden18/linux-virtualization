@@ -13732,16 +13732,6 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_exit);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_enter);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_vmgexit_msr_protocol_exit);
 
-void kvm_arch_eli_remap_vector(struct kvm *kvm,
-	int guest_vector, int host_irq)
-{
-	unsigned long i;
-	struct kvm_vcpu *vcpu;
-	kvm_for_each_vcpu(i, vcpu, kvm) {
-		kvm_x86_ops.eli_remap_vector(vcpu, guest_vector, host_irq);
-	}
-}
-EXPORT_SYMBOL_GPL(kvm_arch_eli_remap_vector);
 
 static int __init kvm_x86_init(void)
 {

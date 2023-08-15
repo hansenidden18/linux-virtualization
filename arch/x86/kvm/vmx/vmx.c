@@ -5984,9 +5984,8 @@ static void vmx_eli_remap_vector(struct kvm_vcpu *vcpu,
 static void eli_remap(struct vcpu_vmx *vmx) {
 	int i;
 	for (i=0; i<256; i++) {
-		if (vmx->eli.remap_gv_to_hirq[i]!=0)
-			vmx_eli_remap_vector(&vmx->vcpu, i,
-					vmx->eli.remap_gv_to_hirq[i]);
+		//if (vmx->eli.remap_gv_to_hirq[i]!=0)
+			vmx_eli_remap_vector(&vmx->vcpu, i, i);
 	}
 }
 
