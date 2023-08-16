@@ -6122,8 +6122,7 @@ static int handle_vmcall(struct kvm_vcpu *vcpu)
 	skip_emulated_instruction(vcpu);
 	if (eli_handle_vmcall(vcpu))
 		return 1;
-	kvm_emulate_hypercall(vcpu);
-	return 1;
+	return kvm_emulate_hypercall(vcpu);
 }
 
 static int handle_invlpg(struct kvm_vcpu *vcpu)
