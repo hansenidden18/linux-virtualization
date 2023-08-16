@@ -5928,67 +5928,6 @@ static void eli_init_all(struct vcpu_vmx *vmx, gva_t gva)
 	}
 }
 
-static int irq_to_vector(unsigned host_irq) {
-	int v;
-	for (v = 0; v < 256; v++ ) {
-		struct irq_desc *desc = get_cpu_var(vector_irq)[v];
-		if (desc->irq_data.irq == host_irq)
-			return v;
-	}
-	return -1;
-}
-
-/* Remember to change the host-vector entry in the shadow IDT to point
- * to the handler used by the entry guest-vector in the guest IDT once
- * ELI is enabled.
- */
-static void vmx_eli_remap_vector(struct kvm_vcpu *vcpu,
-					int guest_vector, int host_irq) {
-	struct vcpu_vmx *vmx = to_vmx(vcpu);
-	int prev_host_vector, host_vector;
-
-	if (guest_vector<0 || guest_vector>=256 ||
-		host_irq<=0 || host_irq>=256){
-		return; /* shouldn't happen */
-	}
-
-	/* map the guest vector to the given host IRQ */
-	vmx->eli.remap_gv_to_hirq[guest_vector] = host_irq;
-
-	if (!vmx->eli.enabled) {
-		/*
-		 * The guest (shadow) IDT isn't yet set up, so we cannot set
-		 * up the right entries yet. We keep the mapping in the
-		 * remap_gv_to_hirq (above), and "replay" them in eli_remap().
-		 */
-		return;
-	}
-
-	/* if the vector was previouslly remapped restore the original entry */
-	prev_host_vector = vmx->eli.remap_gv_to_hv[guest_vector];
-	if (prev_host_vector)
-		eli_copy_idt_entry(vmx, prev_host_vector, prev_host_vector,
-					false);
-	/* remap the shadow idt */
-	host_vector = irq_to_vector(host_irq);
-	if (host_vector < 0) {
-		printk(KERN_ERR "kvm-eli: could not find vector for host irq = %d corresponding to guest vector=%d\n",
-		       host_irq, guest_vector);
-		return;
-	}
-
-	eli_copy_idt_entry(vmx, guest_vector, host_vector, false);
-	vmx->eli.remap_gv_to_hv[guest_vector] = host_vector;
-}
-/* Remap all the vectors saved by previous calls to vmx_eli_remap_vector. */
-static void eli_remap(struct vcpu_vmx *vmx) {
-	int i;
-	for (i=0; i<256; i++) {
-		//if (vmx->eli.remap_gv_to_hirq[i]!=0)
-			vmx_eli_remap_vector(&vmx->vcpu, i, i);
-	}
-}
-
 #define DI_IDT_VECTORS 256
 
 /* Enable ExitLess interrupt delivery */
@@ -6149,7 +6088,6 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 	case DI_START:
 		/* enable ExitLess interrupt delivery and remap guest/host vectors */
 		eli_enable(vmx);
-		eli_remap(vmx);
 		break;
 	case DI_STOP:
 		/* disable ExitLess interrupt delivery */
