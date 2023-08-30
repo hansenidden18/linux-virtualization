@@ -4828,12 +4828,6 @@ static void vmx_enable_nmi_window(struct kvm_vcpu *vcpu)
 }
 
 #define EOI_MSR (APIC_BASE_MSR + (APIC_EOI >> 4)) /* 0x80b */
-static inline void eli_eoi_exiting(struct vcpu_vmx *vmx, bool exiting) {
-	if (exiting)
-		vmx_enable_intercept_for_msr(&vmx->vcpu, EOI_MSR, MSR_TYPE_W);
-	else
-		vmx_disable_intercept_for_msr(&vmx->vcpu, EOI_MSR, MSR_TYPE_W);
-}
 
 /* Enables or disables ELI's injection mode. When injection mode is disabled
  * the guest runs with normal ELI: the shadow IDT is used, and the CPU is
@@ -4878,10 +4872,6 @@ static void eli_set_inject_mode(struct vcpu_vmx *vmx, bool inject_mode) {
 
 	/* Trap or don't trap NP exceptions, depending on injection mode */
 	vmx_update_exception_bitmap(&vmx->vcpu);
-
-	/* allow direct EOI access only if we don't run in injection mode */
-	if (vmx->eli.exitless_eoi)
-		eli_eoi_exiting(vmx, inject_mode);
 }
 
 static void vmx_inject_irq(struct kvm_vcpu *vcpu, bool reinjected)
@@ -5928,6 +5918,68 @@ static void eli_init_all(struct vcpu_vmx *vmx, gva_t gva)
 	}
 }
 
+static int irq_to_vector(unsigned host_irq) {
+	int v;
+	for (v = 0; v < 256; v++ ) {
+		struct irq_desc *desc = get_cpu_var(vector_irq)[v];
+		if (desc->irq_data.irq == host_irq)
+			return v;
+	}
+	return -1;
+}
+
+/* Remember to change the host-vector entry in the shadow IDT to point
+ * to the handler used by the entry guest-vector in the guest IDT once
+ * ELI is enabled.
+ */
+static void vmx_eli_remap_vector(struct kvm_vcpu *vcpu,
+					int guest_vector, int host_irq) {
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int prev_host_vector, host_vector;
+
+	if (guest_vector<0 || guest_vector>=256 ||
+		host_irq<=0 || host_irq>=256){
+		return; /* shouldn't happen */
+	}
+
+	/* map the guest vector to the given host IRQ */
+	vmx->eli.remap_gv_to_hirq[guest_vector] = host_irq;
+
+	if (!vmx->eli.enabled) {
+		/*
+		 * The guest (shadow) IDT isn't yet set up, so we cannot set
+		 * up the right entries yet. We keep the mapping in the
+		 * remap_gv_to_hirq (above), and "replay" them in eli_remap().
+		 */
+		return;
+	}
+
+	/* if the vector was previouslly remapped restore the original entry */
+	prev_host_vector = vmx->eli.remap_gv_to_hv[guest_vector];
+	if (prev_host_vector)
+		eli_copy_idt_entry(vmx, prev_host_vector, prev_host_vector,
+					false);
+	/* remap the shadow idt */
+	host_vector = irq_to_vector(host_irq);
+	if (host_vector < 0) {
+		printk(KERN_ERR "kvm-eli: could not find vector for host irq = %d corresponding to guest vector=%d\n",
+		       host_irq, guest_vector);
+		return;
+	}
+
+	eli_copy_idt_entry(vmx, guest_vector, host_vector, false);
+	vmx->eli.remap_gv_to_hv[guest_vector] = host_vector;
+}
+/* Remap all the vectors saved by previous calls to vmx_eli_remap_vector. */
+static void eli_remap(struct vcpu_vmx *vmx) {
+	int i;
+	for (i=0; i<256; i++) {
+		if (vmx->eli.remap_gv_to_hirq[i]!=0)
+			vmx_eli_remap_vector(&vmx->vcpu, i,
+					vmx->eli.remap_gv_to_hirq[i]);
+	}
+}
+
 #define DI_IDT_VECTORS 256
 
 /* Enable ExitLess interrupt delivery */
@@ -6068,9 +6120,6 @@ static int eli_complete_interrupts(struct vcpu_vmx *vmx, u32 exit_intr_info) {
 
 #define DI_INITIALIZE             300
 
-/* hypercalls used to start/stop ExitLess interrupt completion (EOI) */
-#define DI_START_EOI             1101
-#define DI_STOP_EOI              1201
 /* hypercalls used to start/stop ExitLess interrupt delivery */
 #define DI_START                  500
 #define DI_STOP                   600
@@ -6082,33 +6131,20 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 	unsigned long vmcall_id = kvm_register_read(vcpu, VCPU_REGS_RAX);
 	switch (vmcall_id) {
 	case DI_INITIALIZE:
+		printk(KERN_WARNING "kvm-eli: Initializing ELI\n");
 		eli_init_all(vmx,
 			(gva_t) kvm_register_read(&vmx->vcpu, VCPU_REGS_RBX));
+		printk(KERN_WARNING "kvm-eli: Done Initializing ELI\n");
 		break;
 	case DI_START:
 		/* enable ExitLess interrupt delivery and remap guest/host vectors */
+		printk(KERN_WARNING "kvm-eli: Enabling ELI\n");
 		eli_enable(vmx);
+		eli_remap(vmx);
 		break;
 	case DI_STOP:
 		/* disable ExitLess interrupt delivery */
 		eli_disable(vmx);
-		break;
-	case DI_START_EOI:
-		/* enable ExitLess interrupt completion */
-		if (!irqchip_in_kernel(vcpu->kvm) ||
-			!apic_x2apic_mode(vcpu->arch.apic)) {
-			printk(KERN_WARNING "kvm-eli: Can't enable Exitless EOI: no x2APIC\n");
-		} else {
-			vmx->eli.exitless_eoi = true;
-			eli_eoi_exiting(vmx, vmx->eli.inject_mode);
-		}
-		break;
-	case DI_STOP_EOI:
-		/* disable ExitLess interrupt completion */
-		if (vmx->eli.exitless_eoi) {
-			eli_eoi_exiting(vmx, true);
-			vmx->eli.exitless_eoi = false;
-		}
 		break;
 	default:
 		return 0; /* hypercall was not handled here */
@@ -6119,7 +6155,6 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 
 static int handle_vmcall(struct kvm_vcpu *vcpu)
 {
-	skip_emulated_instruction(vcpu);
 	if (eli_handle_vmcall(vcpu))
 		return 1;
 	return kvm_emulate_hypercall(vcpu);
@@ -7204,7 +7239,7 @@ void vmx_set_virtual_apic_mode(struct kvm_vcpu *vcpu)
 	if (!lapic_in_kernel(vcpu))
 		return;
 
-	if (!cpu_has_vmx_virtualize_x2apic_mode())
+	if (!flexpriority_enabled && !cpu_has_vmx_virtualize_x2apic_mode())
 		return;
 
 	/* Postpone execution until vmcs01 is the current VMCS. */
