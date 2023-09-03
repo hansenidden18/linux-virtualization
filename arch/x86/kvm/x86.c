@@ -2046,7 +2046,7 @@ int kvm_emulate_wrmsr(struct kvm_vcpu *vcpu)
 	int r;
 	
 	if (to_vmx(vcpu)->eli.exit_handled) {
-		return kvm_skip_emulated_instruction(vcpu);
+		return static_call(kvm_x86_skip_emulated_instruction)(vcpu);
 	}
 	
 	r = kvm_set_msr_with_filter(vcpu, ecx, data);

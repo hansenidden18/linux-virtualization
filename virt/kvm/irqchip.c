@@ -180,7 +180,7 @@ static void remap_guest_host(struct kvm *kvm, int guest_irq, int host_irq){
 	    hlist_empty(&irq_rt->map[guest_irq])) {
 		pr_warn_once("no route for guest_irq %u/%u (broken user space?)\n",
 			     guest_irq, irq_rt->nr_rt_entries);
-		sruc_read_unlock(&kvm->irq_srcu, idx);
+		srcu_read_unlock(&kvm->irq_srcu, idx);
 		return;
 	}
 

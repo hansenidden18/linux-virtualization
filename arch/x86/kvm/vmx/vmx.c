@@ -6156,7 +6156,7 @@ static int eli_handle_vmcall(struct kvm_vcpu *vcpu)
 static int handle_vmcall(struct kvm_vcpu *vcpu)
 {
 	if (eli_handle_vmcall(vcpu))
-		return 1;
+		return skip_emulated_instruction(vcpu);
 	return kvm_emulate_hypercall(vcpu);
 }
 
@@ -7461,6 +7461,13 @@ static void handle_exception_nmi_irqoff(struct vcpu_vmx *vmx)
 {
 	const unsigned long nmi_entry = (unsigned long)asm_exc_nmi_noist;
 	u32 intr_info = vmx_get_intr_info(&vmx->vcpu);
+	vmx->exit_intr_info = intr_info;
+
+	/* handle ELI related exits */
+	if(eli_complete_interrupts(vmx, intr_info)){
+		vmx->idt_vectoring_info = 0;
+		return;
+	}
 
 	/* if exit due to PF check for async PF */
 	if (is_page_fault(intr_info))
@@ -7766,7 +7773,6 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	unsigned long cr3, cr4;
-	u32 exit_intr_info;
 
 	/* Record the guest's net vcpu time for enforced NMI injections. */
 	if (unlikely(!enable_vnmi &&
@@ -7919,13 +7925,6 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
 		return EXIT_FASTPATH_NONE;
 
 	vmx->loaded_vmcs->launched = 1;
-
-	exit_intr_info = vmx_get_intr_info(&vmx->vcpu);
-
-	/* handle ELI related exits */
-	if(eli_complete_interrupts(vmx, exit_intr_info)){
-		vmx->idt_vectoring_info = 0;
-	}
 
 	vmx_recover_nmi_blocking(vmx);
 	vmx_complete_interrupts(vmx);
