@@ -49,10 +49,6 @@
 DEFINE_PER_CPU(vector_irq_t, vector_irq) = {
 	[0 ... NR_VECTORS - 1] = VECTOR_UNUSED,
 };
-EXPORT_PER_CPU_SYMBOL(vector_irq);
-
-void (*posted_interrupt_handler)(void) = NULL;
-EXPORT_SYMBOL(posted_interrupt_handler);
 
 void __init init_ISA_irqs(void)
 {
@@ -69,8 +65,10 @@ void __init init_ISA_irqs(void)
 
 	legacy_pic->init(0);
 
-	for (i = 0; i < nr_legacy_irqs(); i++)
+	for (i = 0; i < nr_legacy_irqs(); i++) {
 		irq_set_chip_and_handler(i, chip, handle_level_irq);
+		irq_set_status_flags(i, IRQ_LEVEL);
+	}
 }
 
 void __init init_IRQ(void)

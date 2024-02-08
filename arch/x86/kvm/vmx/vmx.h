@@ -93,18 +93,6 @@ union vmx_exit_reason {
 	u32 full;
 };
 
-static inline bool intel_pmu_has_perf_global_ctrl(struct kvm_pmu *pmu)
-{
-	/*
-	 * Architecturally, Intel's SDM states that IA32_PERF_GLOBAL_CTRL is
-	 * supported if "CPUID.0AH: EAX[7:0] > 0", i.e. if the PMU version is
-	 * greater than zero.  However, KVM only exposes and emulates the MSR
-	 * to/for the guest if the guest PMU supports at least "Architectural
-	 * Performance Monitoring Version 2".
-	 */
-	return pmu->version > 1;
-}
-
 struct lbr_desc {
 	/* Basic info about guest LBR records. */
 	struct x86_pmu_lbr records;
@@ -338,69 +326,6 @@ struct vcpu_vmx {
 	/* Support for a guest hypervisor (nested VMX) */
 	struct nested_vmx nested;
 
-	/* we need to change the x2apic msr bitmaps per vcpu thus
-	 * we can't use global bitmaps */
-	unsigned long *vmx_msr_bitmap_legacy_x2apic;
-	unsigned long *vmx_msr_bitmap_longmode_x2apic;
-	
-	struct {
-		/* IDTR used to run the guest when ELI is enabled.
-		 * This descriptor points to the shadow IDT (GVA).
-		 */
-		struct desc_ptr host_idt;
-		/* IDTR the guest believes it is using (GVA).
-		 */
-		struct desc_ptr guest_idt;
-		/* Guest physical address of the shadow IDT (note that
-		 * host_idt.address is the guest virtual address).
-		 */
-		gpa_t host_idt_gpa;
-		/* Indicates if ELI is enabled or not */
-		bool enabled;
-		
-		bool exitless_eoi;
-
-		bool inject_mode;
-
-		bool exit_handled;
-		/*
-		 * The guest and host use different vectors for the assigned
-		 * device interrupts. This field is used to remap the vectors
-		 * of the shadow IDT so they point to the corresponding
-		 * handler in the guest.
-		 */
-		int remap_gv_to_hirq[256];
-		int remap_gv_to_hv[256];
-	} eli;
-	struct {
-		/* Whether virtual interrupt injection via paravirtual
-		 * posted interrupts is enabled or not.
-		 */
-		bool enabled;
-		/* Address of guest variable which the host will fill with the
-		 * vector used for paravirtual posted interrupts (the guest
-		 * cannot currently control this choice).
-		 */
-		gpa_t notif_vector_gpa;
-		/* Address of a guest page (must be page aligned) in which the
-		 * host writes the vector being injected for each vcpu (one
-		 * u32_t per vcpu).
-		 */
-		gpa_t injected_vector_gpa;
-		/* Host page of injected_vector_gpa, and pointer directly
-		 * to this vcpu's vector being injected
-		 */
-		struct page *shared_descriptor_page;
-		int *shared_descriptor;
-		/* Data corresponding to the last vector injected via PV PI.
-		 * Required in case the IPI arrives in root mode and the
-		 * vector needs to be re-injected.
-		 */
-		int injected_vector;
-		int injected_delivery_mode;
-		int injected_level;
-		int injected_trig_mode;
-	} posted_interrupts;
 	/* Dynamic PLE window. */
 	unsigned int ple_window;
 	bool ple_window_dirty;
@@ -432,7 +357,7 @@ struct vcpu_vmx {
 	struct lbr_desc lbr_desc;
 
 	/* Save desired MSR intercept (read: pass-through) state */
-#define MAX_POSSIBLE_PASSTHROUGH_MSRS	15
+#define MAX_POSSIBLE_PASSTHROUGH_MSRS	16
 	struct {
 		DECLARE_BITMAP(read, MAX_POSSIBLE_PASSTHROUGH_MSRS);
 		DECLARE_BITMAP(write, MAX_POSSIBLE_PASSTHROUGH_MSRS);
@@ -703,12 +628,30 @@ BUILD_CONTROLS_SHADOW(tertiary_exec, TERTIARY_VM_EXEC_CONTROL, 64)
 				(1 << VCPU_EXREG_EXIT_INFO_1) | \
 				(1 << VCPU_EXREG_EXIT_INFO_2))
 
-static inline struct kvm_vmx *to_kvm_vmx(struct kvm *kvm)
+static inline unsigned long vmx_l1_guest_owned_cr0_bits(void)
+{
+	unsigned long bits = KVM_POSSIBLE_CR0_GUEST_BITS;
+
+	/*
+	 * CR0.WP needs to be intercepted when KVM is shadowing legacy paging
+	 * in order to construct shadow PTEs with the correct protections.
+	 * Note!  CR0.WP technically can be passed through to the guest if
+	 * paging is disabled, but checking CR0.PG would generate a cyclical
+	 * dependency of sorts due to forcing the caller to ensure CR0 holds
+	 * the correct value prior to determining which CR0 bits can be owned
+	 * by L1.  Keep it simple and limit the optimization to EPT.
+	 */
+	if (!enable_ept)
+		bits &= ~X86_CR0_WP;
+	return bits;
+}
+
+static __always_inline struct kvm_vmx *to_kvm_vmx(struct kvm *kvm)
 {
 	return container_of(kvm, struct kvm_vmx, kvm);
 }
 
-static inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
+static __always_inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
 {
 	return container_of(vcpu, struct vcpu_vmx, vcpu);
 }
@@ -732,25 +675,23 @@ void intel_pmu_cross_mapped_check(struct kvm_pmu *pmu);
 int intel_pmu_create_guest_lbr_event(struct kvm_vcpu *vcpu);
 void vmx_passthrough_lbr_msrs(struct kvm_vcpu *vcpu);
 
-static inline unsigned long vmx_get_exit_qual(struct kvm_vcpu *vcpu)
+static __always_inline unsigned long vmx_get_exit_qual(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 
-	if (!kvm_register_is_available(vcpu, VCPU_EXREG_EXIT_INFO_1)) {
-		kvm_register_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_1);
+	if (!kvm_register_test_and_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_1))
 		vmx->exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
-	}
+
 	return vmx->exit_qualification;
 }
 
-static inline u32 vmx_get_intr_info(struct kvm_vcpu *vcpu)
+static __always_inline u32 vmx_get_intr_info(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 
-	if (!kvm_register_is_available(vcpu, VCPU_EXREG_EXIT_INFO_2)) {
-		kvm_register_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_2);
+	if (!kvm_register_test_and_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_2))
 		vmx->exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
-	}
+
 	return vmx->exit_intr_info;
 }
 

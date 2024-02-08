@@ -106,14 +106,6 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 	for_each_online_cpu(j)
 		seq_printf(p, "%10u ", irq_stats(j)->irq_tlb_count);
 	seq_puts(p, "  TLB shootdowns\n");
-	seq_printf(p, "%*s: ", prec, "PIs");
-	for_each_online_cpu(j)
-		seq_printf(p, "%10u ", irq_stats(j)->irq_eli_pis_count);
-	seq_printf(p, "  ELVIS PIs\n");	
-	seq_printf(p, "%*s: ", prec, "ELI");
-	for_each_online_cpu(j)
-		seq_printf(p, "%10u ", irq_stats(j)->irq_eli_count);
-	seq_printf(p, "  ELI IPIs\n");
 #endif
 #ifdef CONFIG_X86_THERMAL_VECTOR
 	seq_printf(p, "%*s: ", prec, "TRM");
@@ -173,10 +165,10 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 	seq_printf(p, "%*s: %10u\n", prec, "MIS", atomic_read(&irq_mis_count));
 #endif
 #ifdef CONFIG_HAVE_KVM
-	//seq_printf(p, "%*s: ", prec, "PIN");
-	//for_each_online_cpu(j)
-	//	seq_printf(p, "%10u ", irq_stats(j)->kvm_posted_intr_ipis);
-	//seq_puts(p, "  Posted-interrupt notification event\n");
+	seq_printf(p, "%*s: ", prec, "PIN");
+	for_each_online_cpu(j)
+		seq_printf(p, "%10u ", irq_stats(j)->kvm_posted_intr_ipis);
+	seq_puts(p, "  Posted-interrupt notification event\n");
 
 	seq_printf(p, "%*s: ", prec, "NPI");
 	for_each_online_cpu(j)
@@ -219,6 +211,13 @@ u64 arch_irq_stat_cpu(unsigned int cpu)
 #ifdef CONFIG_X86_MCE_THRESHOLD
 	sum += irq_stats(cpu)->irq_threshold_count;
 #endif
+#ifdef CONFIG_X86_HV_CALLBACK_VECTOR
+	sum += irq_stats(cpu)->irq_hv_callback_count;
+#endif
+#if IS_ENABLED(CONFIG_HYPERV)
+	sum += irq_stats(cpu)->irq_hv_reenlightenment_count;
+	sum += irq_stats(cpu)->hyperv_stimer0_count;
+#endif
 #ifdef CONFIG_X86_MCE
 	sum += per_cpu(mce_exception_count, cpu);
 	sum += per_cpu(mce_poll_count, cpu);
@@ -252,13 +251,6 @@ DEFINE_IDTENTRY_IRQ(common_interrupt)
 
 	/* entry code tells RCU that we're not quiescent.  Check it. */
 	RCU_LOCKDEP_WARN(!rcu_is_watching(), "IRQ failed to wake up RCU");
-	
-	if (vector == pi_notif_vector) {
-		inc_irq_stat(irq_eli_pis_count);
-		vector = *(pi_injected_vector + smp_processor_id());
-		*(pi_injected_vector + smp_processor_id()) = -1;
-		regs->orig_ax = ~vector;
-	}
 
 	desc = __this_cpu_read(vector_irq[vector]);
 	if (likely(!IS_ERR_OR_NULL(desc))) {
@@ -316,11 +308,11 @@ EXPORT_SYMBOL_GPL(kvm_set_posted_intr_wakeup_handler);
 /*
  * Handler for POSTED_INTERRUPT_VECTOR.
  */
-//DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_kvm_posted_intr_ipi)
-//{
-//	ack_APIC_irq();
-//	inc_irq_stat(kvm_posted_intr_ipis);
-//}
+DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_kvm_posted_intr_ipi)
+{
+	ack_APIC_irq();
+	inc_irq_stat(kvm_posted_intr_ipis);
+}
 
 /*
  * Handler for POSTED_INTERRUPT_WAKEUP_VECTOR.

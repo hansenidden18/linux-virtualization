@@ -28,8 +28,6 @@
 #include <asm/irq.h>
 #include <asm/sections.h>
 
-extern void posted_interrupt(void);
-
 #ifdef	CONFIG_X86_LOCAL_APIC
 struct irq_data;
 struct pci_dev;
@@ -132,7 +130,6 @@ extern char spurious_entries_start[];
 typedef struct irq_desc* vector_irq_t[NR_VECTORS];
 DECLARE_PER_CPU(vector_irq_t, vector_irq);
 
-extern void (*posted_interrupt_handler)(void);
 #endif /* !ASSEMBLY_ */
 
 #endif /* _ASM_X86_HW_IRQ_H */
